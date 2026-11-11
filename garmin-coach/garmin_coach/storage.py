@@ -96,13 +96,30 @@ class Store:
             "SELECT * FROM activities WHERE day >= ? AND day <= ? ORDER BY day",
             ((start or date.min).isoformat(), (end or date.max).isoformat()),
         ).fetchall()
-        return [
-            Activity(
+        ov = self.get_value("activity_overrides") or {}
+        out = []
+        for r in rows:
+            a = Activity(
                 activity_id=r["activity_id"], day=_d(r["day"]), sport=r["sport"], duration_min=r["duration_min"],
                 distance_km=r["distance_km"], avg_hr=r["avg_hr"], load=r["load"],
             )
-            for r in rows
-        ]
+            o = ov.get(a.activity_id)
+            if o:  # käyttäjän korjaus pysyy voimassa, vaikka Garmin-synkronointi päivittäisi alkuperäisen
+                a.sport = o.get("sport", a.sport)
+                if "load" in o:
+                    a.load = o["load"]
+            out.append(a)
+        return out
+
+    def set_activity_override(self, activity_id: str, sport: str | None = None, load: float | None = None) -> None:
+        ov = self.get_value("activity_overrides") or {}
+        cur = ov.get(activity_id, {})
+        if sport:
+            cur["sport"] = sport
+        if load is not None:
+            cur["load"] = load
+        ov[activity_id] = cur
+        self.set_value("activity_overrides", ov)
 
     # --- asetukset ---------------------------------------------------------------
     def _set(self, key: str, value: dict) -> None:

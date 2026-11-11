@@ -143,6 +143,35 @@ def cmd_daily(st: Store, a) -> None:
     cmd_report(st, a)
 
 
+INTENSITY_LOAD_PER_MIN = {"easy": 1.0, "moderate": 1.8, "hard": 2.8}  # samaa asteikkoa kuin TRIMP
+
+
+def cmd_activities(st: Store, a) -> None:
+    from .analysis import activity_load
+    p, end = st.profile(), a.end or date.today()
+    rest = p.resting_hr or 55
+    print(f"{'id':<22}{'pvm':<12}{'laji':<20}{'min':>5}{'km':>7}{'syke':>6}{'kuorma':>8}")
+    for x in reversed(st.activities(end - timedelta(days=a.days - 1), end)):
+        print(f"{x.activity_id:<22}{x.day!s:<12}{x.sport:<20}{x.duration_min:>5.0f}{(x.distance_km or 0):>7.1f}"
+              f"{(x.avg_hr or 0):>6.0f}{activity_load(x, p.max_hr, rest):>8.0f}{'' if x.is_run else '  (ei juoksu)'}")
+
+
+def cmd_tag(st: Store, a) -> None:
+    """Korjaa väärin luokiteltu harjoitus, esim. työharjoitus joka näkyy Garminissa 'hyroxina'."""
+    match = [x for x in st.activities() if x.activity_id == a.activity_id]
+    if not match:
+        raise ValueError(f"Harjoitusta '{a.activity_id}' ei löydy. Katso tunnisteet: garmin-coach activities")
+    x = match[0]
+    load = a.load
+    if a.intensity:
+        load = round(x.duration_min * INTENSITY_LOAD_PER_MIN[a.intensity], 1)
+    if not (a.sport or load is not None):
+        raise ValueError("Anna --sport ja/tai --intensity / --load.")
+    st.set_activity_override(a.activity_id, a.sport, load)
+    print(f"Päivitetty {a.activity_id}: laji={a.sport or x.sport}" + (f", kuorma={load}" if load is not None else ""))
+    print("Aja 'garmin-coach plan', niin ohjelma päivittyy.")
+
+
 def cmd_check_garmin(st: Store, a) -> None:
     from .sources import garmin_connect
     day = a.day or date.today()
@@ -186,6 +215,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--days", type=int, default=30, help="montako päivää taaksepäin")
     sp.add_argument("--end", type=_date)
     sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("activities", help="listaa viimeisimmät harjoitukset tunnisteineen")
+    sp.add_argument("--days", type=int, default=14)
+    sp.add_argument("--end", type=_date)
+    sp.set_defaults(func=cmd_activities)
+
+    sp = sub.add_parser("tag", help="korjaa harjoituksen laji tai kuorma (korjaus säilyy synkronoinneissa)")
+    sp.add_argument("activity_id")
+    sp.add_argument("--sport", help="esim. smoke_diving")
+    sp.add_argument("--intensity", choices=tuple(INTENSITY_LOAD_PER_MIN), help="kuorma = kesto × kerroin (easy 1,0 / moderate 1,8 / hard 2,8)")
+    sp.add_argument("--load", type=float, help="kuorma suoraan (sama asteikko kuin Garminin training load)")
+    sp.set_defaults(func=cmd_tag)
 
     sp = sub.add_parser("check-garmin", help="testaa Garmin-yhteys: kirjaudu ja näytä yhden päivän data tallentamatta")
     sp.add_argument("--day", type=_date, help="päivä (oletus tänään)")

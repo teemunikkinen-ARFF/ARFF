@@ -5,6 +5,7 @@ Neljä tasoa, lyhyimmästä pisimpään vaikutukseen:
    ja väliin jäänyt laatuharjoitus siirretään viikon myöhempään vapaaseen päivään, jos se mahtuu turvallisesti.
 2. HRV:n 7 vrk trendi alle normaalin → kuluvan viikon loput tehoharjoitukset muutetaan peruslenkeiksi.
 3. Akuutti kuorma liian korkea (ACWR > 1,5) → seuraavat 3 päivää kevyesti ja lyhyemmin.
+3b. Raskas edellinen päivä (kuorma ≥ 3 × normaali) → tämän päivän teho/pitkä lenkki kevenee.
 4. Toteuma: jos kahden edellisen viikon juoksumäärä jäi alle 80 % suunnitellusta, tulevien viikkojen
    volyymi nostetaan toteutuneesta tasosta maltillisesti (+8 %/vko) eikä hypätä takaisin ohjelman tasolle.
 
@@ -20,6 +21,8 @@ from .models import WEEKDAYS_FI, Activity, Goal, Session
 from .planner import PHASE_RACE, WEEKLY_INCREASE, describe, monday, r05
 
 COMPLIANCE_THRESHOLD = 0.8
+HEAVY_DAY_FACTOR = 3.0  # edellisen päivän kuorma vs. CTL (keskimääräinen päiväkuorma)
+HEAVY_DAY_MIN_CTL = 20.0
 MIN_SESSION_KM = 3.0
 
 
@@ -150,6 +153,22 @@ def adapt_plan(
             notes.append(f"{reason}: tämän viikon tehoharjoitukset vaihdettu peruslenkeiksi.")
         else:
             notes.append(f"{reason}: pidä loppuviikko kevyenä, vaikka ohjelmassa ei ole tehoharjoituksia.")
+
+    # 1a. Raskas edellinen päivä (esim. työharjoitus + treeni samana päivänä). Aamun HRV/leposyke ei välttämättä
+    # ehdi näyttää rasitusta, joten kevennetään tämän päivän tehoa/pitkää lenkkiä ennakoiden.
+    y_load = analysis.load.daily.get(as_of - timedelta(days=1), 0.0)
+    if y_load >= HEAVY_DAY_FACTOR * max(analysis.load.ctl, HEAVY_DAY_MIN_CTL):
+        t = plan.get(as_of)
+        reason = f"Eilen raskas päivä (kuorma {y_load:.0f}, normaali {analysis.load.ctl:.0f}/pv)"
+        if t and t.is_quality:
+            plan[as_of] = _rebuild(t, "easy", t.distance_km * 0.8, goal, zones, reason)
+            notes.append(f"{reason}: tämän päivän {t.title.lower()} vaihdettu kevyeksi peruslenkiksi.")
+        elif t and t.kind == "long":
+            plan[as_of] = _rebuild(t, "long", t.distance_km * 0.8, goal, zones, reason)
+            notes.append(f"{reason}: pitkää lenkkiä lyhennetty 20 %.")
+        elif t and t.kind not in ("rest", "race"):
+            plan[as_of] = _rebuild(t, t.kind, t.distance_km * 0.8, goal, zones, reason)
+            notes.append(f"{reason}: tämän päivän {t.title.lower()} lyhennetty 20 %, pidä se tosi rauhallisena (Z1–Z2).")
 
     # 1. Päivän valmius
     today = plan.get(as_of)

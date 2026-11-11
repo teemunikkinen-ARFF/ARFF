@@ -87,3 +87,16 @@ Running more than planned never raises the plan: volume is never set above the b
 ```bash
 pip install -e ".[dev]" && pytest
 ```
+
+## Correcting a mislabelled activity
+
+Garmin may file an activity under the wrong sport (e.g. a work exercise recorded as "hyrox"), and
+the heart-rate-based load estimate can be off (heat, protective gear, stress inflate HR).
+
+```bash
+garmin-coach activities --days 7                       # list ids, sports, loads
+garmin-coach tag garmin-123456 --sport smoke_diving --intensity hard   # easy | moderate | hard, or --load N
+garmin-coach plan                                      # plan updates
+```
+The correction survives later syncs. Non-running activities are counted as load, never as run kilometres.
+A day whose load is ≥ 3× your normal daily load makes the next day's quality session or long run easier.

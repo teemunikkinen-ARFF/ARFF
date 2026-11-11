@@ -348,3 +348,27 @@ def test_garmin_fetch_survives_partial_failures():
     m, a = garmin_connect.fetch(FakeGarmin(), TODAY - timedelta(days=1), TODAY, log=lambda *_: None)
     assert len(m) == 2 and m[0].resting_hr == 47 and m[0].hrv_ms == 61 and m[0].sleep_hours is None
     assert len(a) == 1
+
+
+def test_heavy_previous_day_softens_today():
+    g, plan = build_phase_plan()
+    plan = _with_today(plan, "tempo")
+    an = neutral_analysis()
+    an.load.daily[TODAY - timedelta(days=1)] = 250.0  # ctl = 30 -> 250 >= 3 * 30
+    new, notes, _ = adapt_plan(plan, g, ZONES, TODAY, an, [], [], {})
+    t = {s.day: s for s in new}[TODAY]
+    assert t.kind == "easy" and "Eilen raskas" in t.adjusted
+    # tavallinen päivä ei laukaise sääntöä
+    an.load.daily[TODAY - timedelta(days=1)] = 60.0
+    new, _, _ = adapt_plan(plan, g, ZONES, TODAY, an, [], [], {})
+    assert {s.day: s for s in new}[TODAY].kind == "tempo"
+
+
+def test_activity_override_survives_resync():
+    st = Store(":memory:")
+    a = Activity("garmin-1", TODAY, "hyrox", 75, None, 150, 90.0)
+    st.upsert_activities([a])
+    st.set_activity_override("garmin-1", sport="smoke_diving", load=300.0)
+    st.upsert_activities([a])  # uusi synkronointi kirjoittaa alkuperäisen takaisin
+    got = st.activities()[0]
+    assert got.sport == "smoke_diving" and got.load == 300.0 and not got.is_run
