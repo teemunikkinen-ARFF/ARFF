@@ -54,8 +54,8 @@ def _rebuild(s: Session, kind: str, amount: float, goal: Goal, zones, reason: st
         return replace(s, kind=kind, distance_km=km, title=title, details=details, adjusted=prev + reason)
     if s.sport == "strength":
         mins = cycling.r5(max(30, amount))
-        emphasis = "lower" if "alavartalo" in s.title.lower() else "upper"
-        title, details = cycling.describe_strength(mins, emphasis, light=True)
+        title, details = cycling.describe_strength(mins, cycling.strength_emphasis(s.title), light=True,
+                                                   on_shift=s.daytype == "shift")
         return replace(s, kind="strength", duration_min=float(mins), title=title, details=details,
                        adjusted=prev + reason)
     mins = cycling.r5(max(cycling.MIN_BIKE_MIN, amount))

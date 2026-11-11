@@ -406,8 +406,8 @@ def test_cycling_week_structure(bikes, strength, long_day):
         by = {s.day: s for s in plan}
         for s in week:
             nxt = by.get(s.day + timedelta(days=1))
-            if s.sport == "strength" and nxt and (nxt.is_quality or nxt.kind == "long"):
-                assert "ylävartalo" in s.title, "alavartalovoima ennen laatu-/pitkää ajoa"
+            if s.sport == "strength":
+                assert s.title.startswith("Voima ") and s.duration_min <= cycling.STRENGTH_MIN
             if s.sport == "bike":
                 assert s.distance_km == 0 and s.duration_min >= cycling.MIN_BIKE_MIN
 
@@ -541,7 +541,7 @@ def test_cycling_end_to_end_with_smoke_dive_correction(tmp_path):
     assert main(["--db", db, "plan", "--as-of", TODAY.isoformat()]) == 0
     assert main(["--db", db, "report", "--as-of", TODAY.isoformat(), "-o", str(out)]) == 0
     html = out.read_text()
-    assert "Pyöräilykunto" in html and "FTP 255 W" in html and "Voima:" in html
+    assert "Pyöräilykunto" in html and "FTP 255 W" in html and "Voima A" in html
     assert main(["--db", db, "goal", "--type", "cycling", "--days", "6"]) == 2
 
 
@@ -590,8 +590,8 @@ def test_shift_plan_respects_work_rhythm(bikes, strength):
             assert not nxt.is_quality, "laatu laatun perään"
         if s.kind == "long" and nxt:
             assert not nxt.is_quality, "laatuajo pitkän ajon perään"
-        if s.sport == "strength" and "alavartalo" in s.title and nxt:
-            assert not (nxt.is_quality or nxt.kind == "long" or "alavartalo" in nxt.title)
+        if s.sport == "strength":
+            assert s.duration_min <= cycling.STRENGTH_MIN
     for wk in sorted({monday(s.day) for s in plan}):
         week = [s for s in plan if monday(s.day) == wk]
         rides = [s for s in week if s.sport == "bike"]
@@ -687,3 +687,31 @@ def test_cli_shifts_and_cycling_plan_with_calendar(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Vuoron jälkeinen päivä" in out and "Työvuoro" in out
     assert main(["--db", db, "shifts", "add"]) == 2
+
+
+LEG_TERMS = ("kyykky", "jalkapr", "maastaveto", "askelkyykky", "pohke", "alavartalo", "squat", "lunge", "leg press",
+             "romanialainen")
+
+
+def test_no_leg_exercises_anywhere_doctors_order():
+    """Lääkärin kielto: ei jalkaharjoittelua salilla. Mikään suunnitelma tai mukautus ei saa sisältää jalkaliikkeitä."""
+    from garmin_coach.adapt import _rebuild
+    plans = [
+        build_reference_plan(bike_goal(), ZONES, until=date(2027, 3, 1)),
+        build_reference_plan(bike_goal(days_per_week=4, strength_days=2, long_run_weekday=5), ZONES, until=date(2027, 3, 1)),
+        build_reference_plan(shift_goal(strength_days=3), ZONES, until=date(2027, 3, 1)),
+    ]
+    seen = set()
+    for plan in plans:
+        for s in plan:
+            if s.sport == "strength":
+                seen.add(cycling.strength_emphasis(s.title))
+                text = (s.title + " " + s.details).lower()
+                assert not any(t in text for t in LEG_TERMS), text
+                light = _rebuild(s, "strength", s.duration_min, bike_goal(), ZONES, "testi")
+                assert not any(t in (light.title + light.details).lower() for t in LEG_TERMS)
+                assert cycling.strength_emphasis(light.title) == cycling.strength_emphasis(s.title)
+    assert seen == {"pull", "push", "core"}
+    for plan in plans:  # viikon sali-järjestys A, B, C
+        week = sorted((s for s in plan if s.sport == "strength" and monday(s.day) == date(2026, 11, 16)), key=lambda x: x.day)
+        assert [cycling.strength_emphasis(s.title) for s in week][:3] == list(cycling.STRENGTH_KINDS)[: len(week)]

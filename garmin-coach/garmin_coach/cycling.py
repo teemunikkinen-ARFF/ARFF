@@ -8,8 +8,8 @@ Periaatteet:
   alkaa päivitetyllä FTP:llä, joten watit seuraavat kehittymistäsi.
 * Viikkotunnit kasvavat enintään 8 % viikossa, katto = 1,5 × nykyinen (tai --max-hours).
 * Työvuorokalenterilla: ajot vapaille päiville, vuoropäivälle lyhyt valinnainen ajo (≤ 75 min) vain tarvittaessa.
-* Voimaharjoittelu on ylläpitoa: kohtuullinen volyymi, 2 toiston vara. Alavartalopainotteinen sessio ei osu
-  päivälle ennen laatuajoa tai pitkää ajoa (silloin ylävartalopainotteinen).
+* Voimaharjoittelu: vain ylä- ja keskivartalo (lääkärin kielto jalkaharjoittelulle salilla; jalkavoima tulee
+  pyörältä). Sessiot A (veto), B (työntö), C (ylä-/keskivartalo), 40–45 min, 2 toiston vara.
 """
 from __future__ import annotations
 
@@ -26,7 +26,8 @@ from .planner import (
 PHASE_TEST = "Testiviikko"
 MACRO_WEEKS = 12
 MIN_BIKE_MIN = 30
-STRENGTH_MIN = 60
+STRENGTH_MIN = 45  # voimasalin kesto (min)
+STRENGTH_KINDS = ("pull", "push", "core")  # sali A, B, C viikon järjestyksessä
 
 # Päivät suhteessa pitkän ajon päivään (0 = pitkä ajo, 1 = seuraava päivä, ...).
 BIKE_LAYOUT = {
@@ -154,20 +155,35 @@ def describe_quality(kind: str, minutes: int, step: int, light: bool, ftp: int |
     return title, f"15 min lämmittely, {body}, palautus {rest} min kevyesti, 10 min verryttely. Yht. {minutes} min.{tag}"
 
 
+STRENGTH_TITLES = {
+    "pull": "Voima A: veto + keskivartalo",
+    "push": "Voima B: työntö + keskivartalo",
+    "core": "Voima C: ylä- ja keskivartalo",
+}
+STRENGTH_BODY = {
+    "pull": "leuanveto lisäpainolla 4 × 5, rintatuettu soutu 4 × 6, takaolkapäät 2 × 12, keskivartalo 2 sarjaa",
+    "push": "penkkipunnerrus 4 × 5, pystypunnerrus istuen 3 × 6, ojentajat 2 × 10, ab wheel tai muu keskivartalo 2 sarjaa",
+    "core": "ylävartalon volyymi RPE 7 (veto ja työntö 3 × 8–10), keskivartalo 3 sarjaa, liikkuvuus",
+}
+
+
+def strength_emphasis(title: str) -> str:
+    """Päättelee session tyypin otsikosta (A = veto, B = työntö, C = ylä-/keskivartalo)."""
+    for kind, t in STRENGTH_TITLES.items():
+        if title.startswith(t.split(":")[0]):
+            return kind
+    return "core"
+
+
 def describe_strength(minutes: int, emphasis: str, light: bool, on_shift: bool = False) -> tuple[str, str]:
-    if emphasis == "lower":
-        title = "Voima: alavartalo"
-        body = ("kyykky tai jalkaprässi 3 × 5–6, romanialainen maastaveto 3 × 6, askelkyykky 2 × 8/jalka, "
-                "pohkeet 2 × 12, keskivartalo 2 sarjaa")
-    else:
-        title = "Voima: ylävartalo"
-        body = ("penkki- tai pystypunnerrus 3 × 5–6, soutu 3 × 6–8, leuanveto 3 × 6–8, olkapäät/ojentajat 2 × 10, "
-                "keskivartalo 2 sarjaa. Jalat vain kevyesti, ei kuormitusta ennen laatu-/pitkää ajoa")
+    """Vain ylä- ja keskivartalo: lääkärin kielto jalkaharjoittelulle salilla. Jalkojen voima tulee pyörältä."""
+    title = STRENGTH_TITLES[emphasis]
     light_txt = " Kevyt versio: 2 sarjaa/liike, ei lähelle epäonnistumista." if light else ""
     if on_shift:
         title += " (työvuorossa, valinnainen)"
         light_txt += " Tee vain jos vuoro sallii; jätä väliin, jos yö meni huonosti tai hälytyksiä tuli."
-    return title, f"{minutes} min: {body}. Jätä 2 toistoa varaan. Käytä omia liikkeitäsi, tämä on runko.{light_txt}"
+    return title, (f"{minutes} min: {STRENGTH_BODY[emphasis]}. Jätä 2 toistoa varaan, pysy aikarajassa. "
+                   f"Ei jalkaliikkeitä (lääkärin kielto).{light_txt}")
 
 
 # --- viikon rakentaminen ---------------------------------------------------------------
@@ -250,15 +266,12 @@ def build_week(week: Week, week_start: date, goal: Goal, zones: dict[str, tuple[
 
     slots: dict[int, Session] = {off: _ride(slot, total * shares[slot], week, day_of(off), goal, zones)
                                  for slot, off in layout.items()}
-    # Voimaharjoitukset omille päivilleen (ohjelmassa yksi sessio/päivä). Jos seuraavana päivänä on laatu- tai
-    # pitkä ajo, sessio on ylävartalopainotteinen.
-    hard_offsets = {off for off, s in slots.items() if s.is_quality or s.kind == "long"}
-    strength_offsets = [o for o in STRENGTH_PREFS if o not in slots][: goal.strength_days]
+    # Voimaharjoitukset omille päivilleen (ohjelmassa yksi sessio/päivä), viikon järjestyksessä A, B, C.
+    strength_offsets = sorted([o for o in STRENGTH_PREFS if o not in slots][: goal.strength_days], key=day_of)
     strength: dict[int, Session] = {}
-    for off in strength_offsets:
-        emphasis = "upper" if ((off + 1) % 7) in hard_offsets else "lower"
-        mins = 45 if week.deload else STRENGTH_MIN
-        title, det = describe_strength(mins, emphasis, week.deload)
+    for i, off in enumerate(strength_offsets):
+        mins = 40 if week.deload else STRENGTH_MIN
+        title, det = describe_strength(mins, STRENGTH_KINDS[i % 3], week.deload)
         strength[off] = _session(day_of(off), "strength", "strength", mins, week.phase, week.index, title, det)
 
     out: list[Session] = []
@@ -367,29 +380,13 @@ def build_week_shifts(week: Week, week_start: date, goal: Goal, zones,
         first = min(by_day.values(), key=lambda x: x.day)
         first.adjusted = f"Ajoja mahtuu tällä viikolla vain {len(placed)}/{n} (työvuorot)"
 
-    hard_days = {d: s for d, s in by_day.items() if s.is_quality or s.kind == "long"}
     cands = [d for d in shift_d if d not in by_day] + [d for d in free if d not in by_day]
-    for d in cands[: goal.strength_days]:
-        emphasis = "upper" if (d + timedelta(days=1)) in hard_days else "lower"
+    for i, d in enumerate(sorted(cands[: goal.strength_days])):
         on_shift = dtype[d] == "shift"
-        m = 45 if (week.deload or on_shift) else STRENGTH_MIN
-        title, det = describe_strength(m, emphasis, week.deload, on_shift)
+        m = 40 if (week.deload or on_shift) else STRENGTH_MIN
+        title, det = describe_strength(m, STRENGTH_KINDS[i % 3], week.deload, on_shift)
         by_day[d] = _session(d, "strength", "strength", m, week.phase, week.index, title, det, dtype[d])
     return [by_day.get(d) or _rest(d, week, dtype[d]) for d in days]
-
-
-def _fix_strength_sequence(sessions: list[Session]) -> None:
-    """Viikkorajat ylittävät säännöt: alavartalovoima ei laatu-/pitkää ajoa edeltävänä päivänä eikä kahtena
-    peräkkäisenä päivänä; muuten sessio vaihdetaan ylävartalopainotteiseksi."""
-    by_day = {s.day: s for s in sessions}
-    for s in sorted(sessions, key=lambda x: x.day):
-        if s.sport != "strength" or "alavartalo" not in s.title:
-            continue
-        nxt, prev = by_day.get(s.day + timedelta(days=1)), by_day.get(s.day - timedelta(days=1))
-        if (nxt and (nxt.is_quality or nxt.kind == "long")) or (
-                prev and prev.sport == "strength" and "alavartalo" in prev.title):
-            s.title, s.details = describe_strength(int(s.duration_min), "upper", "Kevyt versio" in s.details,
-                                                  s.daytype == "shift")
 
 
 def build_cycling_plan(goal: Goal, zones: dict[str, tuple[int, int]], until: date | None = None) -> list[Session]:
@@ -406,5 +403,4 @@ def build_cycling_plan(goal: Goal, zones: dict[str, tuple[int, int]], until: dat
         else:
             week = builder(w, ws, goal, zones)
         out.extend(week)
-    _fix_strength_sequence(out)
     return out

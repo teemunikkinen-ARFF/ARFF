@@ -100,8 +100,9 @@ garmin-coach plan
 (default 1.5 × current). The plan is a 12-week cycle: base (sweet spot, tempo) → build (threshold, over-unders)
 → peak (VO2max + threshold) → test week (20-min FTP test). Every 4th week is lighter. Targets are in **watts**
 from your FTP; after a test run `garmin-coach profile --ftp <new>` and the plan updates.
-Strength sessions go on their own days (lower body never the day before a quality or long ride, then it is
-upper-body focused). The strength content is a generic frame: keep your own exercises.
+Strength sessions go on their own days and are **upper body and core only** (A pull, B push, C upper/core,
+40–45 min): there are no leg exercises in the gym, leg strength comes from the bike. The content is a frame; keep
+your own exercises.
 
 ### Shift work (24 h on, 72 h off)
 
