@@ -7,6 +7,7 @@ verkkokutsuista ja ne käsittelevät puuttuvat kentät sallivasti.
 
 Tunnukset: ympäristömuuttujat GARMIN_EMAIL ja GARMIN_PASSWORD. Ensimmäisen kirjautumisen jälkeen
 tokenit tallennetaan hakemistoon GARMINTOKENS (oletus ~/.garminconnect), jolloin salasanaa ei enää tarvita.
+Vaatii garminconnect >= 0.3 (vanhemmat garth-muotoiset tokenit eivät kelpaa – kirjaudu kerran uudelleen).
 """
 from __future__ import annotations
 
@@ -78,27 +79,55 @@ def parse_activity(a: dict) -> Activity | None:
 # --- verkkokutsut ---------------------------------------------------------------------
 
 def connect():
+    """Kirjautuu. Tallennetut tokenit käytetään ensin; muuten kirjaudutaan tunnuksilla ja tokenit tallennetaan.
+
+    garminconnect >= 0.3 hoitaa tokenien latauksen ja tallennuksen itse `login(tokenstore)`-kutsussa.
+    """
     try:
-        from garminconnect import Garmin
+        from garminconnect import Garmin, GarminConnectAuthenticationError
     except ImportError as e:  # pragma: no cover
-        raise SystemExit("Asenna Garmin-tuki: pip install 'garmin-coach[garmin]'  (tai pip install garminconnect)") from e
+        raise SystemExit("Asenna Garmin-tuki: pip install -e '.[garmin]'  (tai pip install -U garminconnect)") from e
 
     tokenstore = Path(os.environ.get("GARMINTOKENS", "~/.garminconnect")).expanduser()
-    if tokenstore.exists():
-        try:
-            api = Garmin()
-            api.login(str(tokenstore))
-            return api
-        except Exception:  # vanhentuneet tokenit -> kirjaudutaan uudelleen
-            pass
     email, password = os.environ.get("GARMIN_EMAIL"), os.environ.get("GARMIN_PASSWORD")
-    if not email or not password:
-        raise SystemExit("Aseta ympäristömuuttujat GARMIN_EMAIL ja GARMIN_PASSWORD ensimmäistä kirjautumista varten.")
-    api = Garmin(email=email, password=password, prompt_mfa=lambda: input("Garmin MFA-koodi: "))
-    api.login()
-    tokenstore.mkdir(parents=True, exist_ok=True)
-    api.garth.dump(str(tokenstore))
+    api = Garmin(email=email, password=password, prompt_mfa=lambda: input("Garmin MFA-koodi: ").strip())
+    try:
+        api.login(str(tokenstore))
+    except GarminConnectAuthenticationError as e:
+        if not (email and password):
+            raise SystemExit(
+                f"Kirjautuminen epäonnistui ({e}).\n"
+                "Ensimmäisellä kerralla (tai kun tokenit ovat vanhentuneet) aseta GARMIN_EMAIL ja GARMIN_PASSWORD."
+            ) from e
+        raise SystemExit(f"Kirjautuminen epäonnistui: {e}") from e
     return api
+
+
+def check(api, day: date) -> list[str]:
+    """Hakee yhden päivän ja viikon harjoitukset tallentamatta mitään. Palauttaa raporttirivit."""
+    ds = day.isoformat()
+    out = []
+    for label, call, parse in (
+        ("Leposyke", lambda: api.get_heart_rates(ds), parse_resting_hr),
+        ("HRV", lambda: api.get_hrv_data(ds), parse_hrv),
+        ("Uni", lambda: api.get_sleep_data(ds), parse_sleep),
+    ):
+        try:
+            raw = call()
+            keys = ", ".join(list(raw.keys())[:8]) if isinstance(raw, dict) else type(raw).__name__
+            out.append(f"  {label:<9} {parse(raw)}   [vastauksen kentät: {keys}]")
+        except Exception as e:
+            out.append(f"  {label:<9} VIRHE {type(e).__name__}: {e}")
+    try:
+        raw = api.get_activities_by_date((day - timedelta(days=7)).isoformat(), ds) or []
+        acts = [a for a in (parse_activity(x) for x in raw) if a]
+        out.append(f"  Harjoitukset 7 vrk: {len(raw)} haettu, {len(acts)} tulkittu")
+        for a in acts[:5]:
+            out.append(f"    {a.day} {a.sport:<20} {a.duration_min:5.0f} min  {a.distance_km or 0:5.1f} km  "
+                       f"syke {a.avg_hr or '-'}  kuorma {a.load or '-'}")
+    except Exception as e:
+        out.append(f"  Harjoitukset VIRHE {type(e).__name__}: {e}")
+    return out
 
 
 def fetch(api, start: date, end: date, log=print) -> tuple[list[DailyMetrics], list[Activity]]:

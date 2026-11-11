@@ -320,3 +320,31 @@ def test_cli_end_to_end(tmp_path):
     html = out.read_text()
     assert "<svg" in html and "Ohjelman muutosloki" in html
     assert main(["--db", db, "goal", "--type", "half"]) == 2  # päivämäärä puuttuu
+
+
+class FakeGarmin:
+    def get_heart_rates(self, d):
+        return {"restingHeartRate": 47}
+
+    def get_hrv_data(self, d):
+        return {"hrvSummary": {"lastNightAvg": 61}}
+
+    def get_sleep_data(self, d):
+        raise RuntimeError("palvelin ei vastannut")
+
+    def get_activities_by_date(self, s, e):
+        return [{"activityId": 9, "startTimeLocal": "2026-11-10 07:00:00", "activityType": {"typeKey": "running"},
+                 "duration": 1800, "distance": 5000, "averageHR": 140}]
+
+
+def test_garmin_check_reports_values_and_errors():
+    lines = "\n".join(garmin_connect.check(FakeGarmin(), TODAY))
+    assert "47.0" in lines and "61.0" in lines
+    assert "VIRHE RuntimeError" in lines  # yksittäinen virhe ei kaada tarkistusta
+    assert "1 haettu, 1 tulkittu" in lines
+
+
+def test_garmin_fetch_survives_partial_failures():
+    m, a = garmin_connect.fetch(FakeGarmin(), TODAY - timedelta(days=1), TODAY, log=lambda *_: None)
+    assert len(m) == 2 and m[0].resting_hr == 47 and m[0].hrv_ms == 61 and m[0].sleep_hours is None
+    assert len(a) == 1

@@ -28,7 +28,10 @@ garmin-coach report -o report.html
 ## With your own Garmin data
 
 ```bash
-export GARMIN_EMAIL=... GARMIN_PASSWORD=...   # only needed for the first login
+read -p "Email: " GARMIN_EMAIL; read -s -p "Password: " GARMIN_PASSWORD; echo
+export GARMIN_EMAIL GARMIN_PASSWORD           # only needed for the first login
+garmin-coach check-garmin                     # test the connection: shows one day's data, saves nothing
+unset GARMIN_PASSWORD
 garmin-coach sync garmin --days 90            # first time: enough history for the baselines
 garmin-coach daily garmin                     # after that, daily: sync 3 days + plan + report
 ```
@@ -70,8 +73,9 @@ Running more than planned never raises the plan: volume is never set above the b
 ## Limitations — read these
 
 - **Garmin has no open API for individuals.** The sync uses the unofficial `garminconnect` library,
-  which can break when Garmin changes its login. The parsing is tested against known response
-  formats, but not against a live account. CSV import is the fallback.
+  which can break when Garmin changes its login (requires version ≥ 0.3.20). The field names have been
+  checked against the library's own type definitions, but not against a live account —
+  `check-garmin` is the first real test. CSV import is the fallback.
 - The readiness weights are **heuristic**, not a validated medical model. If you have symptoms
   of illness, don't train no matter what the score says.
 - The training plan is running-focused. Other sports are counted in the load but not planned.

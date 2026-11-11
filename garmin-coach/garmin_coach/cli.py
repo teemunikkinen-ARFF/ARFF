@@ -143,6 +143,17 @@ def cmd_daily(st: Store, a) -> None:
     cmd_report(st, a)
 
 
+def cmd_check_garmin(st: Store, a) -> None:
+    from .sources import garmin_connect
+    day = a.day or date.today()
+    print("Kirjaudutaan Garmin Connectiin ...")
+    api = garmin_connect.connect()
+    print(f"Kirjautuminen OK. Haetaan {day} (mitään ei tallenneta):")
+    for line in garmin_connect.check(api, day):
+        print(line)
+    print("\nJos arvot näyttävät oikeilta, aja: garmin-coach sync garmin --days 90")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="garmin-coach", description="Garmin-datan analyysi ja mukautuva harjoitusohjelma.")
     p.add_argument("--db", default=str(DEFAULT_DB), help=f"tietokanta (oletus {DEFAULT_DB}, tai GARMIN_COACH_DB)")
@@ -175,6 +186,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--days", type=int, default=30, help="montako päivää taaksepäin")
     sp.add_argument("--end", type=_date)
     sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("check-garmin", help="testaa Garmin-yhteys: kirjaudu ja näytä yhden päivän data tallentamatta")
+    sp.add_argument("--day", type=_date, help="päivä (oletus tänään)")
+    sp.set_defaults(func=cmd_check_garmin)
 
     sp = sub.add_parser("status", help="näytä päivän valmius")
     sp.add_argument("--as-of", type=_date)
