@@ -256,15 +256,21 @@ def compute_readiness(hrv: HrvState, rhr: RhrState, sleep: SleepState, load: Loa
     return Readiness(score=score, level=level, reasons=reasons, confidence=confidence)
 
 
-def analyze(metrics: list[DailyMetrics], activities: list[Activity], profile: Profile, as_of: date) -> Analysis:
+def analyze(metrics: list[DailyMetrics], activities: list[Activity], profile: Profile, as_of: date,
+            exclude_days: set[date] | None = None) -> Analysis:
+    """`exclude_days`: päivät, joiden yön mittaukset eivät ole vertailukelpoisia (esim. 24 h vuoron jälkeinen aamu)."""
+    if exclude_days:
+        metrics = [m for m in metrics if m.day not in exclude_days]
     rest_hr = profile.resting_hr or rhr_baseline(metrics, as_of + timedelta(days=1)) or 60
     hrv = analyze_hrv(metrics, as_of)
     rhr = analyze_rhr(metrics, as_of)
     sleep = analyze_sleep(metrics, as_of, profile.sleep_target_h)
     load = analyze_load(activities, as_of, profile.max_hr, rest_hr)
+    readiness = compute_readiness(hrv, rhr, sleep, load)
+    if exclude_days and as_of in exclude_days:
+        readiness.reasons.insert(0, "Työvuoron jälkeinen päivä: yön uni-, HRV- ja leposykearvoja ei käytetä (eivät vertailukelpoisia)")
     return Analysis(
-        as_of=as_of, hrv=hrv, rhr=rhr, sleep=sleep, load=load,
-        readiness=compute_readiness(hrv, rhr, sleep, load), resting_hr_used=float(rest_hr),
+        as_of=as_of, hrv=hrv, rhr=rhr, sleep=sleep, load=load, readiness=readiness, resting_hr_used=float(rest_hr),
     )
 
 

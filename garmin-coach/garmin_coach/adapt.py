@@ -279,7 +279,7 @@ def _find_slot(plan: dict[date, Session], as_of: date, goal: Goal) -> date | Non
     d = as_of + timedelta(days=2)  # vähintään yksi palautumispäivä välissä
     while d <= week_end:
         s = plan.get(d)
-        if s and s.kind == "rest":
+        if s and s.kind == "rest" and s.daytype in ("", "free"):  # ei työvuoro- tai vuoron jälkeiselle päivälle
             neighbours = [plan.get(d - timedelta(days=1)), plan.get(d + timedelta(days=1))]
             if all(n is None or (n.kind not in ("long", "race") and not n.is_quality) for n in neighbours):
                 return d

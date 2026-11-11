@@ -14,8 +14,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
+from itertools import permutations
 
 from .models import Goal, Session
+from .shifts import day_type
 from .planner import (
     DELOAD_FACTOR, PHASE_BASE, PHASE_BUILD, PHASE_DELOAD, PHASE_PEAK, WEEKLY_INCREASE, monday,
 )
@@ -151,7 +153,7 @@ def describe_quality(kind: str, minutes: int, step: int, light: bool, ftp: int |
     return title, f"15 min lämmittely, {body}, palautus {rest} min kevyesti, 10 min verryttely. Yht. {minutes} min.{tag}"
 
 
-def describe_strength(minutes: int, emphasis: str, light: bool) -> tuple[str, str]:
+def describe_strength(minutes: int, emphasis: str, light: bool, on_shift: bool = False) -> tuple[str, str]:
     if emphasis == "lower":
         title = "Voima: alavartalo"
         body = ("kyykky tai jalkaprässi 3 × 5–6, romanialainen maastaveto 3 × 6, askelkyykky 2 × 8/jalka, "
@@ -161,57 +163,80 @@ def describe_strength(minutes: int, emphasis: str, light: bool) -> tuple[str, st
         body = ("penkki- tai pystypunnerrus 3 × 5–6, soutu 3 × 6–8, leuanveto 3 × 6–8, olkapäät/ojentajat 2 × 10, "
                 "keskivartalo 2 sarjaa. Jalat vain kevyesti, ei kuormitusta ennen laatu-/pitkää ajoa")
     light_txt = " Kevyt versio: 2 sarjaa/liike, ei lähelle epäonnistumista." if light else ""
+    if on_shift:
+        title += " (työvuorossa, valinnainen)"
+        light_txt += " Tee vain jos vuoro sallii; jätä väliin, jos yö meni huonosti tai hälytyksiä tuli."
     return title, f"{minutes} min: {body}. Jätä 2 toistoa varaan. Käytä omia liikkeitäsi, tämä on runko.{light_txt}"
 
 
 # --- viikon rakentaminen ---------------------------------------------------------------
 
-def _session(day: date, kind: str, sport: str, minutes: int, phase: str, week: int, title: str, details: str) -> Session:
+PRIORITY = {  # sijoitusjärjestys; viimeiset pudotetaan ensin, jos vapaita päiviä on liian vähän
+    3: ["q1", "long", "q2"],
+    4: ["q1", "long", "q2", "easy"],
+    5: ["q1", "long", "q2", "easy", "easy2"],
+}
+REST_TEXT = {
+    "shift": ("Työvuoro", "24 h vuoro, ei suunniteltua harjoitusta (hälytykset, katkonainen uni)."),
+    "post": ("Vuoron jälkeinen päivä", "Palaudu: nuku tarvittaessa, kevyt kävely ok. Yön uni- ja HRV-arvoja ei käytetä valmiusarviossa."),
+    "free": ("Lepo", "Lepo tai kevyt liikkuvuus/venyttely."),
+    "": ("Lepo", "Lepo tai kevyt liikkuvuus/venyttely."),
+}
+
+
+def _session(day: date, kind: str, sport: str, minutes: int, phase: str, week: int, title: str, details: str,
+             daytype: str = "") -> Session:
     return Session(day=day, kind=kind, distance_km=0.0, title=title, details=details, phase=phase,
-                   week_index=week, sport=sport, duration_min=float(minutes))
+                   week_index=week, sport=sport, duration_min=float(minutes), daytype=daytype)
+
+
+def slot_kind(slot: str, week: Week) -> str:
+    """Slotin sisältö tällä viikolla: long | quality | test | easy."""
+    if slot == "long":
+        return "long"
+    if slot == "q1":
+        return "test" if week.test else QUALITY_BY_PHASE[week.train_phase][0]
+    if slot == "q2":
+        return "easy" if (week.test or week.deload) else QUALITY_BY_PHASE[week.train_phase][1]
+    return "easy"
+
+
+def _ride(slot: str, base_min: float, week: Week, day: date, goal: Goal, zones, daytype: str = "") -> Session:
+    ftp = goal.ftp
+    kind = slot_kind(slot, week)
+    if kind == "long":
+        m = r5(min(270, max(60 if week.deload else 75, base_min)))
+        title, det = describe_bike("long", m, week.phase, ftp, zones)
+        return _session(day, "long", "bike", m, week.phase, week.index, title, det, daytype)
+    if kind == "easy":
+        m = r5(max(40, base_min))
+        title, det = describe_bike("easy", m, week.phase, ftp, zones)
+        return _session(day, "easy", "bike", m, week.phase, week.index, title, det, daytype)
+    if kind == "test":
+        m, step, light = max(r5(base_min), 90), 0, False
+    else:
+        step, light = week.step, week.deload
+        m = max(r5(base_min), -(-quality_minutes(kind, step, light)[2] // 5) * 5)
+    title, det = describe_quality(kind, m, step, light, ftp)
+    return _session(day, kind, "bike", m, week.phase, week.index, title, det, daytype)
+
+
+def _rest(day: date, week: Week, daytype: str = "") -> Session:
+    title, det = REST_TEXT[daytype]
+    return Session(day=day, kind="rest", distance_km=0.0, title=title, details=det, phase=week.phase,
+                   week_index=week.index, sport="rest", daytype=daytype)
 
 
 def build_week(week: Week, week_start: date, goal: Goal, zones: dict[str, tuple[int, int]]) -> list[Session]:
-    ftp = goal.ftp
+    """Kiinteä viikkomalli (ei työvuorokalenteria): ajot ja voima sidottu pitkän ajon viikonpäivään."""
     n = goal.days_per_week
     layout, shares = BIKE_LAYOUT[n], SHARES[n]
     long_day = goal.long_run_weekday
     total = week.hours * 60
-    qa = QUALITY_BY_PHASE[week.train_phase]
     day_of = lambda off: week_start + timedelta(days=(long_day + off) % 7)  # noqa: E731
 
-    slots: dict[int, Session] = {}
-    for slot, off in layout.items():
-        base_min = total * shares[slot]
-        if slot == "long":
-            m = r5(min(270, max(60 if week.deload else 75, base_min)))
-            title, det = describe_bike("long", m, week.phase, ftp, zones)
-            s = _session(day_of(off), "long", "bike", m, week.phase, week.index, title, det)
-        elif slot in ("q1", "q2"):
-            kind = qa[0 if slot == "q1" else 1]
-            if week.test:
-                kind = "test" if slot == "q1" else "easy"
-            elif week.deload and slot == "q2":
-                kind = "easy"
-            if kind == "easy":
-                m = r5(max(40, base_min))
-                title, det = describe_bike("easy", m, week.phase, ftp, zones)
-                s = _session(day_of(off), "easy", "bike", m, week.phase, week.index, title, det)
-            else:
-                if kind == "test":
-                    m = max(r5(base_min), 90)
-                    step, light = 0, False
-                else:
-                    step, light = week.step, week.deload
-                    m = max(r5(base_min), -(-quality_minutes(kind, step, light)[2] // 5) * 5)
-                title, det = describe_quality(kind, m, step, light, ftp)
-                s = _session(day_of(off), kind, "bike", m, week.phase, week.index, title, det)
-        else:
-            m = r5(max(40, base_min))
-            title, det = describe_bike("easy", m, week.phase, ftp, zones)
-            s = _session(day_of(off), "easy", "bike", m, week.phase, week.index, title, det)
-        slots[off] = s
-
+    slots: dict[int, Session] = {off: _ride(slot, total * shares[slot], week, day_of(off), goal, zones)
+                                 for slot, off in layout.items()}
     # Voimaharjoitukset omille päivilleen (ohjelmassa yksi sessio/päivä). Jos seuraavana päivänä on laatu- tai
     # pitkä ajo, sessio on ylävartalopainotteinen.
     hard_offsets = {off for off, s in slots.items() if s.is_quality or s.kind == "long"}
@@ -219,29 +244,123 @@ def build_week(week: Week, week_start: date, goal: Goal, zones: dict[str, tuple[
     strength: dict[int, Session] = {}
     for off in strength_offsets:
         emphasis = "upper" if ((off + 1) % 7) in hard_offsets else "lower"
-        light = week.deload
-        mins = STRENGTH_MIN if not light else 45
-        title, det = describe_strength(mins, emphasis, light)
+        mins = 45 if week.deload else STRENGTH_MIN
+        title, det = describe_strength(mins, emphasis, week.deload)
         strength[off] = _session(day_of(off), "strength", "strength", mins, week.phase, week.index, title, det)
 
     out: list[Session] = []
     for i in range(7):
         d = week_start + timedelta(days=i)
         off = (d.weekday() - long_day) % 7
-        if off in slots:
-            out.append(slots[off])
-        elif off in strength:
-            out.append(strength[off])
-        else:
-            out.append(Session(day=d, kind="rest", distance_km=0.0, title="Lepo",
-                               details="Lepo tai kevyt liikkuvuus/venyttely.", phase=week.phase,
-                               week_index=week.index, sport="rest"))
+        out.append(slots.get(off) or strength.get(off) or _rest(d, week))
     return out
+
+
+def _is_hard(kind: str) -> bool:
+    """Kaikki muut kuin peruskestävyysajo (pitkä ajo, testi ja kaikki laatuajot) ovat kovia."""
+    return kind != "easy"
+
+
+def assign_rides(slot_kinds: dict[str, str], free_days: list[date], shifts,
+                 prev_ride: tuple[date, str] | None = None) -> dict[str, date] | None:
+    """Sijoittaa ajot vapaille päiville. Rajoitteet: laatuajo ei peräkkäisenä päivänä toisen laatuajon kanssa eikä
+    pitkän ajon jälkeen (laatu → pitkä sallitaan). Pehmeät: kova ajo ennen työvuoroa ja kovat peräkkäin kaikkein
+    vähiten. Palauttaa None, jos mahdotonta."""
+    names = list(slot_kinds)
+    kinds = dict(slot_kinds)
+    if prev_ride:  # edellisen viikon viimeinen ajo (viikon rajan yli)
+        kinds["_prev"] = prev_ride[1]
+    best, best_key = None, None
+    for combo in permutations(sorted(free_days), len(names)):
+        placed = dict(zip(names, combo))
+        ok, penalty = True, 0
+        items = list(placed.items()) + ([("_prev", prev_ride[0])] if prev_ride else [])
+        items.sort(key=lambda kv: kv[1])
+        for (na, da), (nb, db) in zip(items, items[1:]):
+            if (db - da).days == 1 and _is_hard(kinds[na]) and _is_hard(kinds[nb]):
+                if kinds[na] == "long" or kinds[nb] != "long":
+                    ok = False
+                    break
+                penalty += 1  # laatu → pitkä
+        if not ok:
+            continue
+        for nm, d in placed.items():
+            if _is_hard(slot_kinds[nm]) and (d + timedelta(days=1)) in shifts:
+                penalty += 2  # kova ajo välittömästi ennen vuoroa
+        key = (penalty, tuple(placed[nm].toordinal() for nm in names))
+        if best_key is None or key < best_key:
+            best, best_key = placed, key
+    return best
+
+
+def build_week_shifts(week: Week, week_start: date, goal: Goal, zones,
+                      prev_ride: tuple[date, str] | None = None) -> list[Session]:
+    """Viikko työvuorokalenterin mukaan: ajot vain vapaille päiville, voima ensisijaisesti vuoropäiville."""
+    shifts = goal.shift_days
+    days = [week_start + timedelta(days=i) for i in range(7)]
+    dtype = {d: day_type(d, shifts) for d in days}
+    free = [d for d in days if dtype[d] == "free"]
+    n = goal.days_per_week
+    total = week.hours * 60
+    shares = SHARES[n]
+
+    placed: dict[str, date] = {}
+    wanted = PRIORITY[n]
+    for k in range(len(wanted), 0, -1):
+        names = wanted[:k]
+        if k > len(free):
+            continue
+        res = assign_rides({nm: slot_kind(nm, week) for nm in names}, free, shifts, prev_ride)
+        if res:
+            placed = res
+            break
+    by_day: dict[date, Session] = {}
+    norm = sum(shares[nm] for nm in placed) or 1.0
+    for nm, d in placed.items():
+        by_day[d] = _ride(nm, total * shares[nm] / norm, week, d, goal, zones, "free")
+    if placed and len(placed) < n:
+        first = min(by_day.values(), key=lambda x: x.day)
+        first.adjusted = f"Vapaita päiviä vain {len(free)} tällä viikolla: ajoja {len(placed)}/{n}"
+
+    hard_days = {d for d, s in by_day.items() if s.is_quality or s.kind == "long"}
+    cands = [d for d in days if dtype[d] == "shift"] + [d for d in free if d not in by_day]
+    for d in cands[: goal.strength_days]:
+        nxt = d + timedelta(days=1)
+        emphasis = "upper" if nxt in hard_days else "lower"
+        on_shift = dtype[d] == "shift"
+        mins = 45 if (week.deload or on_shift) else STRENGTH_MIN
+        title, det = describe_strength(mins, emphasis, week.deload, on_shift)
+        by_day[d] = _session(d, "strength", "strength", mins, week.phase, week.index, title, det, dtype[d])
+    return [by_day.get(d) or _rest(d, week, dtype[d]) for d in days]
+
+
+def _fix_strength_sequence(sessions: list[Session]) -> None:
+    """Viikkorajat ylittävät säännöt: alavartalovoima ei laatu-/pitkää ajoa edeltävänä päivänä eikä kahtena
+    peräkkäisenä päivänä; muuten sessio vaihdetaan ylävartalopainotteiseksi."""
+    by_day = {s.day: s for s in sessions}
+    for s in sorted(sessions, key=lambda x: x.day):
+        if s.sport != "strength" or "alavartalo" not in s.title:
+            continue
+        nxt, prev = by_day.get(s.day + timedelta(days=1)), by_day.get(s.day - timedelta(days=1))
+        if (nxt and (nxt.is_quality or nxt.kind == "long")) or (
+                prev and prev.sport == "strength" and "alavartalo" in prev.title):
+            s.title, s.details = describe_strength(int(s.duration_min), "upper", "Kevyt versio" in s.details,
+                                                  s.daytype == "shift")
 
 
 def build_cycling_plan(goal: Goal, zones: dict[str, tuple[int, int]], until: date | None = None) -> list[Session]:
     start, weeks = week_plan(goal, until)
+    builder = build_week_shifts if goal.shift_days is not None else build_week
     out: list[Session] = []
+    prev_ride = None
     for w in weeks:
-        out.extend(build_week(w, start + timedelta(weeks=w.index), goal, zones))
+        ws = start + timedelta(weeks=w.index)
+        if builder is build_week_shifts:
+            week = builder(w, ws, goal, zones, prev_ride)
+            last = week[-1]
+            prev_ride = (last.day, last.kind) if last.sport == "bike" else None
+        else:
+            week = builder(w, ws, goal, zones)
+        out.extend(week)
+    _fix_strength_sequence(out)
     return out

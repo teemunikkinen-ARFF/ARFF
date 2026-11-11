@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS plan_sessions (
     day TEXT PRIMARY KEY,
     kind TEXT NOT NULL, distance_km REAL NOT NULL, title TEXT NOT NULL, details TEXT NOT NULL,
     phase TEXT NOT NULL, week_index INTEGER NOT NULL, adjusted TEXT,
-    sport TEXT NOT NULL DEFAULT 'run', duration_min REAL NOT NULL DEFAULT 0
+    sport TEXT NOT NULL DEFAULT 'run', duration_min REAL NOT NULL DEFAULT 0, daytype TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS plan_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +61,8 @@ class Store:
             self.conn.execute("ALTER TABLE plan_sessions ADD COLUMN sport TEXT NOT NULL DEFAULT 'run'")
         if "duration_min" not in cols:
             self.conn.execute("ALTER TABLE plan_sessions ADD COLUMN duration_min REAL NOT NULL DEFAULT 0")
+        if "daytype" not in cols:
+            self.conn.execute("ALTER TABLE plan_sessions ADD COLUMN daytype TEXT NOT NULL DEFAULT ''")
         self.conn.commit()
 
     def close(self) -> None:
@@ -159,6 +161,14 @@ class Store:
         d["event_date"] = _d(d["event_date"]) if d.get("event_date") else None
         return Goal(**d)
 
+    def shift_calendar(self):
+        from .shifts import ShiftCalendar
+        d = self._get("shifts")
+        return ShiftCalendar.from_json(d) if d else None
+
+    def save_shift_calendar(self, cal) -> None:
+        self._set("shifts", cal.to_json())
+
     def get_value(self, key: str):
         d = self._get(key)
         return d.get("v") if d else None
@@ -176,7 +186,7 @@ class Store:
             Session(
                 day=_d(r["day"]), kind=r["kind"], distance_km=r["distance_km"], title=r["title"],
                 details=r["details"], phase=r["phase"], week_index=r["week_index"], adjusted=r["adjusted"],
-                sport=r["sport"], duration_min=r["duration_min"],
+                sport=r["sport"], duration_min=r["duration_min"], daytype=r["daytype"],
             )
             for r in rows
         ]
@@ -189,9 +199,9 @@ class Store:
                 continue
             self.conn.execute(
                 "INSERT OR REPLACE INTO plan_sessions (day, kind, distance_km, title, details, phase, week_index, adjusted, "
-                "sport, duration_min) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "sport, duration_min, daytype) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (s.day.isoformat(), s.kind, s.distance_km, s.title, s.details, s.phase, s.week_index, s.adjusted,
-                 s.sport, s.duration_min),
+                 s.sport, s.duration_min, s.daytype),
             )
         self.conn.commit()
 

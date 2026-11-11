@@ -83,6 +83,7 @@ class Goal:
     weekly_hours: float = 4.0  # nykyinen pyöräilyaika h/vko
     max_weekly_hours: float | None = None
     ftp: int | None = None  # täytetään profiilista ohjelmaa rakennettaessa, ei tallenneta tavoitteeseen
+    shift_days: frozenset | None = None  # työvuoropäivät (päivämäärät), täytetään kalenterista; ei tallenneta
 
     def validate(self) -> None:
         if self.kind not in GOAL_KINDS:
@@ -144,6 +145,7 @@ class Session:
     adjusted: str | None = None  # syy, jos sessiota on mukautettu datan perusteella
     sport: str = "run"  # run | bike | strength | rest
     duration_min: float = 0.0  # pyörä- ja voimasessioille; juoksulla käytetään matkaa
+    daytype: str = ""  # shift | post | free | "" (työvuorokalenterista)
 
     @property
     def amount(self) -> float:

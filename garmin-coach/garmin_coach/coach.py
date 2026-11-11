@@ -25,9 +25,13 @@ class UpdateResult:
 
 
 def run_analysis(store: Store, as_of: date) -> Analysis:
+    from .shifts import post_shift_days
+
     metrics = store.metrics(as_of - timedelta(days=HISTORY_DAYS), as_of)
     activities = store.activities(as_of - timedelta(days=HISTORY_DAYS), as_of)
-    return analyze(metrics, activities, store.profile(), as_of)
+    cal = store.shift_calendar()
+    exclude = post_shift_days(cal.expand(as_of)) if cal else None
+    return analyze(metrics, activities, store.profile(), as_of, exclude_days=exclude)
 
 
 def update_plan(store: Store, as_of: date) -> UpdateResult:
@@ -39,7 +43,10 @@ def update_plan(store: Store, as_of: date) -> UpdateResult:
     zones = hr_zones(profile.max_hr, analysis.resting_hr_used)
 
     until = goal.event_date or (as_of + timedelta(weeks=FITNESS_HORIZON_WEEKS))
-    goal_eff = replace(goal, ftp=profile.ftp)  # FTP elää profiilissa; ohjelma rakennetaan aina tuoreella arvolla
+    cal = store.shift_calendar() if goal.kind == "cycling" else None
+    shift_set = frozenset(cal.expand(until + timedelta(days=14))) if cal else None
+    # FTP ja vuorokalenteri elävät omissa asetuksissaan; ohjelma rakennetaan aina tuoreilla arvoilla
+    goal_eff = replace(goal, ftp=profile.ftp, shift_days=shift_set)
     reference = build_reference_plan(goal_eff, zones, until)
 
     goal_sig = json.dumps(asdict(goal), default=str, sort_keys=True)

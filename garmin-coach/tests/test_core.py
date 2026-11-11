@@ -523,7 +523,7 @@ def test_store_migrates_old_plan_table(tmp_path):
     c.commit(); c.close()
     st = Store(db)
     s = st.plan()[0]
-    assert s.sport == "run" and s.distance_km == 8.0 and s.duration_min == 0.0
+    assert s.sport == "run" and s.distance_km == 8.0 and s.duration_min == 0.0 and s.daytype == ""
     st.replace_plan_from(date(2026, 11, 12), [replace(s, sport="bike", duration_min=60.0, distance_km=0.0)])
     assert st.plan()[0].sport == "bike"
 
@@ -543,3 +543,122 @@ def test_cycling_end_to_end_with_smoke_dive_correction(tmp_path):
     html = out.read_text()
     assert "Pyöräilykunto" in html and "FTP 255 W" in html and "Voima:" in html
     assert main(["--db", db, "goal", "--type", "cycling", "--days", "6"]) == 2
+
+
+# --- työvuorokalenteri ----------------------------------------------------------------------
+from garmin_coach.shifts import ShiftCalendar, day_type, post_shift_days  # noqa: E402
+from garmin_coach.cycling import assign_rides  # noqa: E402
+
+
+def test_shift_calendar_projection_and_day_types():
+    cal = ShiftCalendar([date(2026, 11, 10)], cycle=4)
+    sh = cal.expand(date(2026, 11, 30))
+    assert sh == {date(2026, 11, d) for d in (10, 14, 18, 22, 26, 30)}
+    assert [day_type(date(2026, 11, d), sh) for d in (10, 11, 12, 13, 14)] == ["shift", "post", "free", "free", "shift"]
+    # Tunnettu myöhempi vuoro ohittaa vanhan rytmin ennusteen
+    cal2 = ShiftCalendar([date(2026, 11, 10), date(2026, 11, 15)], cycle=4)
+    assert date(2026, 11, 14) not in cal2.expand(date(2026, 11, 30)) and date(2026, 11, 19) in cal2.expand(date(2026, 11, 30))
+    assert post_shift_days({date(2026, 11, 10)}) == {date(2026, 11, 11)}
+
+
+def shift_goal(**kw):
+    sh = ShiftCalendar([date(2026, 11, 10)], 4).expand(date(2027, 3, 1))
+    return bike_goal(shift_days=frozenset(sh), **kw)
+
+
+@pytest.mark.parametrize("bikes,strength", [(3, 2), (3, 0), (4, 1), (3, 3)])
+def test_shift_plan_respects_work_rhythm(bikes, strength):
+    g = shift_goal(days_per_week=bikes, strength_days=strength)
+    plan = build_reference_plan(g, ZONES, until=date(2027, 2, 14))
+    by = {s.day: s for s in plan}
+    assert len(by) == len(plan)
+    for s in plan:
+        dt = day_type(s.day, g.shift_days)
+        assert s.daytype == dt
+        if s.sport == "bike":
+            assert dt == "free", "ajo vuoro- tai vuoron jälkeiselle päivälle"
+        if dt == "post":
+            assert s.kind == "rest"
+        if dt == "shift" and s.kind != "rest":
+            assert s.sport == "strength" and s.duration_min <= 45 and "valinnainen" in s.title
+        nxt = by.get(s.day + timedelta(days=1))
+        if s.is_quality and nxt:
+            assert not nxt.is_quality, "laatu laatun perään"
+        if s.kind == "long" and nxt:
+            assert not nxt.is_quality, "laatuajo pitkän ajon perään"
+        if s.sport == "strength" and "alavartalo" in s.title and nxt:
+            assert not (nxt.is_quality or nxt.kind == "long" or "alavartalo" in nxt.title)
+    for wk in sorted({monday(s.day) for s in plan}):
+        week = [s for s in plan if monday(s.day) == wk]
+        rides = [s for s in week if s.sport == "bike"]
+        assert 1 <= len(rides) <= bikes
+        assert sum(1 for s in week if s.sport == "strength") <= strength
+        hours = sum(s.duration_min for s in rides) / 60
+        w = next(x for x in cycling.week_plan(g, until=date(2027, 2, 14))[1] if x.index == week[0].week_index)
+        assert 0.7 * w.hours <= hours <= 1.45 * w.hours, (wk, hours, w.hours)
+
+
+def test_assign_rides_never_puts_hard_before_hard():
+    d = lambda n: date(2026, 11, n)  # noqa: E731
+    kinds = {"q1": "sweetspot", "long": "long", "q2": "tempo"}
+    res = assign_rides(kinds, [d(9), d(10), d(12)], {d(13)})
+    assert res is not None
+    days = sorted(res.items(), key=lambda kv: kv[1])
+    for (na, da), (nb, db) in zip(days, days[1:]):
+        if (db - da).days == 1:
+            assert na != "long" and not (kinds[na] != "long" and kinds[nb] != "long")
+    # kaksi laatuajoa ja vain kaksi peräkkäistä vapaata päivää: ei mahdollinen
+    assert assign_rides({"q1": "tempo", "q2": "threshold"}, [d(9), d(10)], set()) is None
+
+
+def test_shift_plan_drops_lowest_priority_ride_when_few_free_days():
+    # Vuoro joka kolmas päivä: vapaita päiviä vain ~2,3 viikossa
+    sh = frozenset(date(2026, 11, 9) + timedelta(days=3 * i) for i in range(40))  # vuoro, palautus, 1 vapaa
+    g = bike_goal(shift_days=sh, days_per_week=4, strength_days=0)
+    plan = build_reference_plan(g, ZONES, until=date(2026, 12, 6))
+    for wk in sorted({monday(s.day) for s in plan}):
+        week = [s for s in plan if monday(s.day) == wk]
+        rides = [s for s in week if s.sport == "bike"]
+        assert all(s.daytype == "free" for s in rides)
+        assert len(rides) < 4 and any("Vapaita päiviä vain" in (s.adjusted or "") for s in rides)
+
+
+def test_post_shift_data_is_excluded_from_analysis():
+    m = metrics_series(70, TODAY)
+    post_days = {TODAY - timedelta(days=i) for i in (0, 4, 8)}
+    for x in m:
+        if x.day in post_days:  # vuoroyö: huono uni, matala HRV, korkea leposyke
+            x.sleep_hours, x.hrv_ms, x.resting_hr = 3.5, 30.0, 62.0
+    plain = analyze(m, [], Profile(max_hr=188), TODAY)
+    fair = analyze(m, [], Profile(max_hr=188), TODAY, exclude_days=post_days)
+    assert plain.readiness.level != "green"
+    assert fair.hrv.status != "low" and fair.sleep.debt7_h < plain.sleep.debt7_h
+    assert fair.readiness.reasons[0].startswith("Työvuoron jälkeinen päivä")
+
+
+def test_relocation_never_lands_on_shift_or_post_day():
+    g = shift_goal()
+    plan = build_reference_plan(g, ZONES, until=date(2027, 1, 31))
+    day = next(s.day for s in plan if s.kind in ("sweetspot", "tempo") and s.day > date(2026, 11, 20))
+    new, notes, ov = adapt_plan(plan, g, ZONES, day, neutral_analysis("red", 30), [], [], {})
+    moved = [s for s in new if s.adjusted and s.adjusted.startswith("Siirretty")]
+    assert all(s.daytype == "free" for s in moved)
+
+
+def test_cli_shifts_and_cycling_plan_with_calendar(tmp_path, capsys):
+    from garmin_coach.cli import main
+    db = str(tmp_path / "s.db")
+    assert main(["--db", db, "profile", "--max-hr", "190", "--ftp", "240"]) == 0
+    assert main(["--db", db, "goal", "--type", "cycling", "--start", "2026-11-09"]) == 0
+    assert main(["--db", db, "shifts", "set", "--first", "2026-11-10", "--count", "3"]) == 0
+    assert main(["--db", db, "shifts", "add", "2026-11-23"]) == 0
+    assert main(["--db", db, "shifts", "remove", "2026-11-18"]) == 0
+    assert main(["--db", db, "shifts", "show", "--as-of", "2026-11-11", "--weeks", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "TYÖVUORO" in out and "vuoron jälkeen" in out
+    assert Store(db).shift_calendar().dates == [date(2026, 11, 10), date(2026, 11, 14), date(2026, 11, 23)]
+    assert main(["--db", db, "sync", "demo", "--days", "40", "--end", "2026-11-10"]) == 0
+    assert main(["--db", db, "plan", "--as-of", "2026-11-11", "--show", "10"]) == 0
+    out = capsys.readouterr().out
+    assert "Vuoron jälkeinen päivä" in out and "Työvuoro" in out
+    assert main(["--db", db, "shifts", "add"]) == 2

@@ -92,7 +92,7 @@ pip install -e ".[dev]" && pytest
 ## Cycling + strength goal
 
 ```bash
-garmin-coach profile --max-hr 190 --ftp 255
+garmin-coach profile --max-hr 190 --ftp 240
 garmin-coach goal --type cycling --days 3 --strength-days 2 --hours 4 --long-day su
 garmin-coach plan
 ```
@@ -102,6 +102,22 @@ garmin-coach plan
 from your FTP; after a test run `garmin-coach profile --ftp <new>` and the plan updates.
 Strength sessions go on their own days (lower body never the day before a quality or long ride, then it is
 upper-body focused). The strength content is a generic frame: keep your own exercises.
+
+### Shift work (24 h on, 72 h off)
+
+```bash
+garmin-coach shifts set --first 2026-11-10 --count 6     # known shifts; the rhythm continues every 4 days after the last one
+garmin-coach shifts add 2026-11-30 2026-12-05            # real schedule differs from the rhythm: add the known dates
+garmin-coach shifts remove 2026-11-18
+garmin-coach shifts show
+```
+With a shift calendar the plan stops using a fixed weekly template. Rides go **only on free days** (never on a shift day
+or the day after), hard rides are placed so that two quality rides are never back to back and a quality ride never
+follows a long ride (quality → long is allowed), and strength sessions go on shift days first (short, marked optional).
+If a week has too few free days, the lowest-priority rides are dropped and the plan says so.
+The day after a shift is a recovery day, and its overnight sleep/HRV/resting HR are **excluded from the readiness
+analysis and baselines**, because sleep on duty is not comparable to sleep at home. Enter recent past shifts too
+(`shifts add <date>`), otherwise those nights are still treated as normal nights.
 
 Adaptation works the same as for running (readiness, HRV trend, load spikes, heavy previous day), with these differences:
 quality rides are never shortened to meet a volume cap (volume is trimmed from easy and long rides), strength

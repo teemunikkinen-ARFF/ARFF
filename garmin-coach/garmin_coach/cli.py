@@ -176,6 +176,35 @@ def cmd_tag(st: Store, a) -> None:
     print("Aja 'garmin-coach plan', niin ohjelma päivittyy.")
 
 
+def cmd_shifts(st: Store, a) -> None:
+    from .shifts import DEFAULT_CYCLE, ShiftCalendar, day_type
+
+    cal = st.shift_calendar() or ShiftCalendar()
+    if a.action == "set":
+        if not a.first:
+            raise ValueError("Anna --first (ensimmäinen vuoropäivä).")
+        cal = ShiftCalendar([a.first + timedelta(days=a.every * i) for i in range(a.count)], a.every)
+    elif a.action in ("add", "remove"):
+        if not a.dates:
+            raise ValueError("Anna päivämäärät muodossa YYYY-MM-DD.")
+        cal.dates = sorted((set(cal.dates) | set(a.dates)) if a.action == "add" else (set(cal.dates) - set(a.dates)))
+    if a.action != "show":
+        st.save_shift_calendar(cal)
+    if not cal.dates:
+        print("Vuorokalenteri on tyhjä. Aseta: garmin-coach shifts set --first YYYY-MM-DD")
+        return
+    start = a.as_of or date.today()
+    known = ", ".join(f"{fmt_day(d)}" for d in cal.dates if d >= start - timedelta(days=7))
+    print(f"Tunnetut vuorot (viim. 7 pv alkaen): {known or '-'}")
+    print(f"Viimeisen tunnetun ({cal.dates[-1]}) jälkeen rytmi jatkuu {cal.cycle} pv välein.")
+    shifts = cal.expand(start + timedelta(days=a.weeks * 7))
+    names = {"shift": "TYÖVUORO", "post": "vuoron jälkeen", "free": "vapaa"}
+    print(f"\nSeuraavat {a.weeks} viikkoa:")
+    for i in range(a.weeks * 7):
+        d = start + timedelta(days=i)
+        print(f"  {fmt_day(d):<9} {names[day_type(d, shifts)]}")
+
+
 def cmd_check_garmin(st: Store, a) -> None:
     from .sources import garmin_connect
     day = a.day or date.today()
@@ -235,6 +264,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--intensity", choices=tuple(INTENSITY_LOAD_PER_MIN), help="kuorma = kesto × kerroin (easy 1,0 / moderate 1,8 / hard 2,8)")
     sp.add_argument("--load", type=float, help="kuorma suoraan (sama asteikko kuin Garminin training load)")
     sp.set_defaults(func=cmd_tag)
+
+    sp = sub.add_parser("shifts", help="työvuorokalenteri (24 h vuoro + vapaat): set | add | remove | show")
+    sp.add_argument("action", choices=("set", "add", "remove", "show"))
+    sp.add_argument("dates", nargs="*", type=_date, help="päivät (add/remove), vuoron aloituspäivä")
+    sp.add_argument("--first", type=_date, help="set: ensimmäinen vuoropäivä")
+    sp.add_argument("--every", type=int, default=4, help="set: vuorojen väli päivinä (24 h + 72 h vapaa = 4)")
+    sp.add_argument("--count", type=int, default=6, help="set: montako vuoroa luodaan (rytmi jatkuu silti)")
+    sp.add_argument("--weeks", type=int, default=3, help="show: montako viikkoa näytetään")
+    sp.add_argument("--as-of", type=_date)
+    sp.set_defaults(func=cmd_shifts)
 
     sp = sub.add_parser("check-garmin", help="testaa Garmin-yhteys: kirjaudu ja näytä yhden päivän data tallentamatta")
     sp.add_argument("--day", type=_date, help="päivä (oletus tänään)")
