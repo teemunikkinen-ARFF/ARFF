@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "garmin-coach"
+version = "0.1.0"
+description = "Garmin-datan (syke, HRV, uni) analyysi ja tavoitteeseen perustuva, itsestään päivittyvä harjoitusohjelma"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+garmin = ["garminconnect>=0.3.20"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+garmin-coach = "garmin_coach.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["garmin_coach*"]

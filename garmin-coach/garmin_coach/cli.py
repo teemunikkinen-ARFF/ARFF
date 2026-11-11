@@ -1,0 +1,317 @@
+"""Komentoriviliittymä."""
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+from .adapt import fmt_day
+from .coach import run_analysis, update_plan
+from .models import GOAL_KINDS, GOAL_LABELS, WEEKDAYS_FI, Goal, Profile
+from .storage import DEFAULT_DB, Store
+
+LEVEL_ICON = {"green": "VIHREÄ", "yellow": "KELTAINEN", "red": "PUNAINEN"}
+
+
+def _date(s: str) -> date:
+    return date.fromisoformat(s)
+
+
+def _weekday(s: str) -> int:
+    s = s.lower()[:2]
+    if s.isdigit():
+        return int(s)
+    en = ["mo", "tu", "we", "th", "fr", "sa", "su"]
+    if s in WEEKDAYS_FI:
+        return WEEKDAYS_FI.index(s)
+    if s in en:
+        return en.index(s)
+    raise argparse.ArgumentTypeError("viikonpäivä: ma ti ke to pe la su")
+
+
+def cmd_profile(st: Store, a) -> None:
+    p = st.profile()
+    if a.max_hr:
+        p.max_hr = a.max_hr
+    if a.age and not a.max_hr:
+        p.max_hr = round(208 - 0.7 * a.age)  # Tanaka; mitattu maksimisyke on aina parempi
+        print(f"Maksimisyke-arvio iästä: {p.max_hr} bpm (Tanaka). Mitattu arvo on tarkempi.")
+    if a.resting_hr is not None:
+        p.resting_hr = a.resting_hr or None
+    if a.sleep_target:
+        p.sleep_target_h = a.sleep_target
+    if a.ftp:
+        p.ftp = a.ftp
+    st.save_profile(p)
+    print(f"Profiili: maksimisyke {p.max_hr}, leposyke {p.resting_hr or 'mitattu perustaso'}, unitavoite {p.sleep_target_h} h"
+          + (f", FTP {p.ftp} W" if p.ftp else ""))
+
+
+def cmd_goal(st: Store, a) -> None:
+    days = a.days or (3 if a.type == "cycling" else 4)
+    g = Goal(kind=a.type, start_date=a.start or date.today(), event_date=a.date, days_per_week=days,
+             weekly_km=a.weekly_km, long_run_weekday=a.long_day, target_time=a.target_time,
+             strength_days=a.strength_days, weekly_hours=a.hours, max_weekly_hours=a.max_hours)
+    g.validate()
+    st.save_goal(g)
+    print(f"Tavoite tallennettu: {GOAL_LABELS[g.kind]}" + (f", kilpailu {g.event_date}" if g.event_date else ""))
+    print("Ohjelma luodaan seuraavalla 'plan'-ajolla (tai heti, jos annoit --plan).")
+
+
+def cmd_sync(st: Store, a) -> None:
+    end = a.end or date.today()
+    start = end - timedelta(days=a.days - 1)
+    if a.source == "garmin":
+        from .sources import garmin_connect
+        print(f"Haetaan Garmin Connectista {start} – {end} ...")
+        metrics, acts = garmin_connect.fetch(garmin_connect.connect(), start, end)
+    elif a.source == "csv":
+        from .sources import csv_import
+        metrics = csv_import.read_daily(a.daily) if a.daily else []
+        acts = csv_import.read_activities(a.activities) if a.activities else []
+        if not metrics and not acts:
+            raise SystemExit("Anna --daily ja/tai --activities.")
+    else:
+        from .sources import demo
+        metrics, acts = demo.generate(end, a.days)
+    print(f"Tallennettu {st.upsert_metrics(metrics)} päivää mittareita ja {st.upsert_activities(acts)} harjoitusta.")
+
+
+def print_status(st: Store, as_of: date) -> None:
+    an = run_analysis(st, as_of)
+    r = an.readiness
+    print(f"\nValmius {fmt_day(as_of)}: {r.score}/100 [{LEVEL_ICON[r.level]}]  (luotettavuus: {r.confidence})")
+    for reason in r.reasons:
+        print(f"  • {reason}")
+    h, rh, s, ld = an.hrv, an.rhr, an.sleep, an.load
+    if h.last_night_ms:
+        band = f", normaali {h.band_ms[0]:.0f}–{h.band_ms[1]:.0f}" if h.band_ms else " (perustaso muodostuu)"
+        print(f"  HRV      {h.last_night_ms:.0f} ms (7 vrk ka {h.avg7_ms:.0f}{band})")
+    if rh.today:
+        print(f"  Leposyke {rh.today:.0f} bpm" + (f" (perustaso {rh.baseline:.0f}, {rh.delta:+.0f})" if rh.delta is not None else ""))
+    if s.last_night_h:
+        print(f"  Uni      {s.last_night_h:.1f} h (7 vrk ka {s.avg7_h:.1f} h, vaje {s.debt7_h:.1f} h)")
+    acwr = f"{ld.acwr:.2f}" if ld.acwr is not None else "–"
+    print(f"  Kuorma   ATL {ld.atl:.0f} / CTL {ld.ctl:.0f}, ACWR {acwr}")
+
+
+def cmd_plan(st: Store, a) -> None:
+    as_of = a.as_of or date.today()
+    res = update_plan(st, as_of)
+    print_status(st, as_of)
+    if res.regenerated:
+        print("\nOhjelma luotu tavoitteen perusteella.")
+    if res.notes:
+        print("\nMukautukset:")
+        for n in res.notes:
+            print(f"  • {n}")
+    if res.changes:
+        print("\nMuutokset edelliseen versioon:")
+        for c in res.changes:
+            print(f"  ↻ {c}")
+    elif not res.regenerated:
+        print("\nEi muutoksia edelliseen versioon.")
+    print(f"\nOhjelma {a.show} päivää:")
+    for s in res.sessions[: a.show]:
+        mark = " ↻" if s.adjusted else ""
+        print(f"  {fmt_day(s.day):<9} {s.title:<22}{s.label:>9}{mark}  {s.details if s.kind != 'rest' else ''}")
+
+
+def cmd_status(st: Store, a) -> None:
+    print_status(st, a.as_of or date.today())
+
+
+def cmd_report(st: Store, a) -> Path:
+    from .report import render
+    as_of = a.as_of or date.today()
+    notes = st.get_value("last_notes") or []
+    an = run_analysis(st, as_of)
+    html = render(
+        as_of, an, st.goal(), st.profile(), st.metrics(as_of - timedelta(days=130), as_of),
+        st.activities(as_of - timedelta(days=130), as_of), st.plan(as_of - timedelta(days=7), as_of - timedelta(days=1)),
+        st.plan(as_of), notes, st.log_entries(15), a.chart_days,
+    )
+    out = Path(a.output)
+    out.write_text(html, encoding="utf-8")
+    print(f"Raportti: {out.resolve()}")
+    return out
+
+
+def cmd_daily(st: Store, a) -> None:
+    """Päivittäinen ajo: synkronoi viimeiset päivät, päivitä ohjelma, kirjoita raportti."""
+    a.days, a.end = a.sync_days, None
+    cmd_sync(st, a)
+    a.show = 7
+    cmd_plan(st, a)
+    cmd_report(st, a)
+
+
+INTENSITY_LOAD_PER_MIN = {"easy": 1.0, "moderate": 1.8, "hard": 2.8}  # samaa asteikkoa kuin TRIMP
+
+
+def cmd_activities(st: Store, a) -> None:
+    from .analysis import activity_load
+    p, end = st.profile(), a.end or date.today()
+    rest = p.resting_hr or 55
+    print(f"{'id':<22}{'pvm':<12}{'laji':<20}{'min':>5}{'km':>7}{'syke':>6}{'kuorma':>8}")
+    for x in reversed(st.activities(end - timedelta(days=a.days - 1), end)):
+        print(f"{x.activity_id:<22}{x.day!s:<12}{x.sport:<20}{x.duration_min:>5.0f}{(x.distance_km or 0):>7.1f}"
+              f"{(x.avg_hr or 0):>6.0f}{activity_load(x, p.max_hr, rest):>8.0f}{'' if x.is_run else '  (ei juoksu)'}")
+
+
+def cmd_tag(st: Store, a) -> None:
+    """Korjaa väärin luokiteltu harjoitus, esim. työharjoitus joka näkyy Garminissa 'hyroxina'."""
+    match = [x for x in st.activities() if x.activity_id == a.activity_id]
+    if not match:
+        raise ValueError(f"Harjoitusta '{a.activity_id}' ei löydy. Katso tunnisteet: garmin-coach activities")
+    x = match[0]
+    load = a.load
+    if a.intensity:
+        load = round(x.duration_min * INTENSITY_LOAD_PER_MIN[a.intensity], 1)
+    if not (a.sport or load is not None):
+        raise ValueError("Anna --sport ja/tai --intensity / --load.")
+    st.set_activity_override(a.activity_id, a.sport, load)
+    print(f"Päivitetty {a.activity_id}: laji={a.sport or x.sport}" + (f", kuorma={load}" if load is not None else ""))
+    print("Aja 'garmin-coach plan', niin ohjelma päivittyy.")
+
+
+def cmd_shifts(st: Store, a) -> None:
+    from .shifts import DEFAULT_CYCLE, ShiftCalendar, day_type
+
+    cal = st.shift_calendar() or ShiftCalendar()
+    if a.action == "set":
+        if not a.first:
+            raise ValueError("Anna --first (ensimmäinen vuoropäivä).")
+        cal = ShiftCalendar([a.first + timedelta(days=a.every * i) for i in range(a.count)], a.every)
+    elif a.action in ("add", "remove"):
+        if not a.dates:
+            raise ValueError("Anna päivämäärät muodossa YYYY-MM-DD.")
+        cal.dates = sorted((set(cal.dates) | set(a.dates)) if a.action == "add" else (set(cal.dates) - set(a.dates)))
+    if a.action != "show":
+        st.save_shift_calendar(cal)
+    if not cal.dates:
+        print("Vuorokalenteri on tyhjä. Aseta: garmin-coach shifts set --first YYYY-MM-DD")
+        return
+    start = a.as_of or date.today()
+    known = ", ".join(f"{fmt_day(d)}" for d in cal.dates if d >= start - timedelta(days=7))
+    print(f"Tunnetut vuorot (viim. 7 pv alkaen): {known or '-'}")
+    print(f"Viimeisen tunnetun ({cal.dates[-1]}) jälkeen rytmi jatkuu {cal.cycle} pv välein.")
+    shifts = cal.expand(start + timedelta(days=a.weeks * 7))
+    names = {"shift": "TYÖVUORO", "post": "vuoron jälkeen", "free": "vapaa"}
+    print(f"\nSeuraavat {a.weeks} viikkoa:")
+    for i in range(a.weeks * 7):
+        d = start + timedelta(days=i)
+        print(f"  {fmt_day(d):<9} {names[day_type(d, shifts)]}")
+
+
+def cmd_check_garmin(st: Store, a) -> None:
+    from .sources import garmin_connect
+    day = a.day or date.today()
+    print("Kirjaudutaan Garmin Connectiin ...")
+    api = garmin_connect.connect()
+    print(f"Kirjautuminen OK. Haetaan {day} (mitään ei tallenneta):")
+    for line in garmin_connect.check(api, day):
+        print(line)
+    print("\nJos arvot näyttävät oikeilta, aja: garmin-coach sync garmin --days 90")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="garmin-coach", description="Garmin-datan analyysi ja mukautuva harjoitusohjelma.")
+    p.add_argument("--db", default=str(DEFAULT_DB), help=f"tietokanta (oletus {DEFAULT_DB}, tai GARMIN_COACH_DB)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("profile", help="aseta maksimisyke, leposyke ja unitavoite")
+    sp.add_argument("--max-hr", type=int)
+    sp.add_argument("--age", type=int, help="arvioi maksimisyke iästä, jos mitattua ei ole")
+    sp.add_argument("--resting-hr", type=int, help="kiinteä leposyke (0 = käytä mitattua)")
+    sp.add_argument("--sleep-target", type=float, help="unitavoite tunteina")
+    sp.add_argument("--ftp", type=int, help="pyöräilyn FTP wateissa (päivitä testin jälkeen)")
+    sp.set_defaults(func=cmd_profile)
+
+    sp = sub.add_parser("goal", help="aseta tavoite")
+    sp.add_argument("--type", choices=GOAL_KINDS, required=True)
+    sp.add_argument("--date", type=_date, help="kilpailupäivä YYYY-MM-DD")
+    sp.add_argument("--start", type=_date, help="ohjelman aloituspäivä (oletus tänään)")
+    sp.add_argument("--days", type=int, help="harjoituspäiviä viikossa (juoksu 3–6, pyöräily 3–5; oletus 4 / 3)")
+    sp.add_argument("--strength-days", type=int, default=2, help="pyöräilytavoite: voimaharjoituksia viikossa (0–3)")
+    sp.add_argument("--hours", type=float, default=4.0, help="pyöräilytavoite: nykyinen pyöräilyaika h/vko")
+    sp.add_argument("--max-hours", type=float, help="pyöräilytavoite: viikkotuntien katto (oletus 1,5 × nykyinen)")
+    sp.add_argument("--weekly-km", type=float, default=20.0, help="nykyinen juoksumäärä km/vko")
+    sp.add_argument("--long-day", type=_weekday, default=6, help="pitkän lenkin/ajon päivä (ma–su)")
+    sp.add_argument("--target-time", help="tavoiteaika, esim. 1:55:00 (tallennetaan tiedoksi)")
+    sp.set_defaults(func=cmd_goal)
+
+    def add_sync_args(sp):
+        sp.add_argument("source", choices=("garmin", "csv", "demo"))
+        sp.add_argument("--daily", help="CSV: päivittäiset mittarit")
+        sp.add_argument("--activities", help="CSV: harjoitukset")
+
+    sp = sub.add_parser("sync", help="tuo dataa (garmin | csv | demo)")
+    add_sync_args(sp)
+    sp.add_argument("--days", type=int, default=30, help="montako päivää taaksepäin")
+    sp.add_argument("--end", type=_date)
+    sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("activities", help="listaa viimeisimmät harjoitukset tunnisteineen")
+    sp.add_argument("--days", type=int, default=14)
+    sp.add_argument("--end", type=_date)
+    sp.set_defaults(func=cmd_activities)
+
+    sp = sub.add_parser("tag", help="korjaa harjoituksen laji tai kuorma (korjaus säilyy synkronoinneissa)")
+    sp.add_argument("activity_id")
+    sp.add_argument("--sport", help="esim. smoke_diving")
+    sp.add_argument("--intensity", choices=tuple(INTENSITY_LOAD_PER_MIN), help="kuorma = kesto × kerroin (easy 1,0 / moderate 1,8 / hard 2,8)")
+    sp.add_argument("--load", type=float, help="kuorma suoraan (sama asteikko kuin Garminin training load)")
+    sp.set_defaults(func=cmd_tag)
+
+    sp = sub.add_parser("shifts", help="työvuorokalenteri (24 h vuoro + vapaat): set | add | remove | show")
+    sp.add_argument("action", choices=("set", "add", "remove", "show"))
+    sp.add_argument("dates", nargs="*", type=_date, help="päivät (add/remove), vuoron aloituspäivä")
+    sp.add_argument("--first", type=_date, help="set: ensimmäinen vuoropäivä")
+    sp.add_argument("--every", type=int, default=4, help="set: vuorojen väli päivinä (24 h + 72 h vapaa = 4)")
+    sp.add_argument("--count", type=int, default=6, help="set: montako vuoroa luodaan (rytmi jatkuu silti)")
+    sp.add_argument("--weeks", type=int, default=3, help="show: montako viikkoa näytetään")
+    sp.add_argument("--as-of", type=_date)
+    sp.set_defaults(func=cmd_shifts)
+
+    sp = sub.add_parser("check-garmin", help="testaa Garmin-yhteys: kirjaudu ja näytä yhden päivän data tallentamatta")
+    sp.add_argument("--day", type=_date, help="päivä (oletus tänään)")
+    sp.set_defaults(func=cmd_check_garmin)
+
+    sp = sub.add_parser("status", help="näytä päivän valmius")
+    sp.add_argument("--as-of", type=_date)
+    sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("plan", help="päivitä ohjelma uusimmalla datalla ja näytä muutokset")
+    sp.add_argument("--as-of", type=_date)
+    sp.add_argument("--show", type=int, default=14)
+    sp.set_defaults(func=cmd_plan)
+
+    sp = sub.add_parser("report", help="kirjoita HTML-raportti")
+    sp.add_argument("--as-of", type=_date)
+    sp.add_argument("-o", "--output", default="garmin-coach-report.html")
+    sp.add_argument("--chart-days", type=int, default=60)
+    sp.set_defaults(func=cmd_report)
+
+    sp = sub.add_parser("daily", help="sync + plan + report yhdellä komennolla (ajastukseen)")
+    add_sync_args(sp)
+    sp.add_argument("--sync-days", type=int, default=3)
+    sp.add_argument("--as-of", type=_date)
+    sp.add_argument("-o", "--output", default="garmin-coach-report.html")
+    sp.add_argument("--chart-days", type=int, default=60)
+    sp.set_defaults(func=cmd_daily)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    st = Store(args.db)
+    try:
+        args.func(st, args)
+    except ValueError as e:
+        print(f"Virhe: {e}", file=sys.stderr)
+        return 2
+    finally:
+        st.close()
+    return 0
