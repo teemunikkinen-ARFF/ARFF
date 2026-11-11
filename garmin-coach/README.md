@@ -111,10 +111,12 @@ garmin-coach shifts add 2026-11-30 2026-12-05            # real schedule differs
 garmin-coach shifts remove 2026-11-18
 garmin-coach shifts show
 ```
-With a shift calendar the plan stops using a fixed weekly template. Rides go **only on free days** (never on a shift day
-or the day after), hard rides are placed so that two quality rides are never back to back and a quality ride never
-follows a long ride (quality → long is allowed), and strength sessions go on shift days first (short, marked optional).
-If a week has too few free days, the lowest-priority rides are dropped and the plan says so.
+With a shift calendar the plan stops using a fixed weekly template. Rides go on **free days first**; a shift day
+gets a short (≤ 75 min), optional ride only as a fallback (when free days are too few or would force two hard
+sessions back to back). Long rides and FTP tests are never placed on a shift day, and nothing is planned for the day
+after a shift. Hard rides are placed so that two quality rides are never back to back and a quality ride never
+follows a long ride (quality → long is allowed), also across week boundaries. Shift days without a ride get a short
+optional strength session. If a week still has too few days, the lowest-priority rides are dropped and the plan says so.
 The day after a shift is a recovery day, and its overnight sleep/HRV/resting HR are **excluded from the readiness
 analysis and baselines**, because sleep on duty is not comparable to sleep at home. Enter recent past shifts too
 (`shifts add <date>`), otherwise those nights are still treated as normal nights.

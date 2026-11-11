@@ -576,11 +576,15 @@ def test_shift_plan_respects_work_rhythm(bikes, strength):
         dt = day_type(s.day, g.shift_days)
         assert s.daytype == dt
         if s.sport == "bike":
-            assert dt == "free", "ajo vuoro- tai vuoron jälkeiselle päivälle"
+            assert dt in ("free", "shift"), "ajo vuoron jälkeiselle päivälle"
+            if dt == "shift":  # vuoropäivän ajo: lyhyt, valinnainen, ei pitkä ajo eikä testi
+                assert s.kind not in ("long", "test") and s.duration_min <= cycling.SHIFT_RIDE_MAX
+                assert "valinnainen" in s.title
         if dt == "post":
             assert s.kind == "rest"
         if dt == "shift" and s.kind != "rest":
-            assert s.sport == "strength" and s.duration_min <= 45 and "valinnainen" in s.title
+            assert s.sport in ("strength", "bike") and s.duration_min <= cycling.SHIFT_RIDE_MAX
+            assert "valinnainen" in s.title
         nxt = by.get(s.day + timedelta(days=1))
         if s.is_quality and nxt:
             assert not nxt.is_quality, "laatu laatun perään"
@@ -611,16 +615,37 @@ def test_assign_rides_never_puts_hard_before_hard():
     assert assign_rides({"q1": "tempo", "q2": "threshold"}, [d(9), d(10)], set()) is None
 
 
-def test_shift_plan_drops_lowest_priority_ride_when_few_free_days():
-    # Vuoro joka kolmas päivä: vapaita päiviä vain ~2,3 viikossa
-    sh = frozenset(date(2026, 11, 9) + timedelta(days=3 * i) for i in range(40))  # vuoro, palautus, 1 vapaa
-    g = bike_goal(shift_days=sh, days_per_week=4, strength_days=0)
-    plan = build_reference_plan(g, ZONES, until=date(2026, 12, 6))
-    for wk in sorted({monday(s.day) for s in plan}):
-        week = [s for s in plan if monday(s.day) == wk]
-        rides = [s for s in week if s.sport == "bike"]
-        assert all(s.daytype == "free" for s in rides)
-        assert len(rides) < 4 and any("Vapaita päiviä vain" in (s.adjusted or "") for s in rides)
+def test_shift_days_are_fallback_for_rides_and_long_ride_never_on_shift_day():
+    # Normaali 4 pv rytmi: vapaat päivät riittävät, vuoropäivän ajoja vain poikkeuksellisesti
+    g = shift_goal()
+    plan = build_reference_plan(g, ZONES, until=date(2027, 2, 14))
+    weeks = {monday(s.day) for s in plan}
+    assert sum(1 for s in plan if s.sport == "bike" and s.daytype == "shift") <= len(weeks) // 3
+    # Vuoro joka toinen päivä: vapaita päiviä ei ole, ajot vain vuoropäiville; pitkää ajoa ei voi sijoittaa
+    sh = frozenset(date(2026, 11, 9) + timedelta(days=2 * i) for i in range(40))
+    g2 = bike_goal(shift_days=sh, days_per_week=4, strength_days=0)
+    plan2 = build_reference_plan(g2, ZONES, until=date(2026, 12, 6))
+    rides = [s for s in plan2 if s.sport == "bike"]
+    assert rides and all(s.daytype == "shift" and "valinnainen" in s.title for s in rides)
+    assert not any(s.kind in ("long", "test") for s in rides)
+    for wk in sorted({monday(s.day) for s in plan2}):
+        week_rides = [s for s in rides if monday(s.day) == wk]
+        assert len(week_rides) < 4 and any("Ajoja mahtuu" in (s.adjusted or "") for s in week_rides)
+
+
+def test_capped_shift_ride_volume_goes_to_long_ride():
+    # Vuoro joka kolmas päivä: vapaita päiviä on vähän, joten osa ajoista siirtyy vuoropäiville
+    sh = frozenset(date(2026, 11, 9) + timedelta(days=3 * i) for i in range(40))
+    g = bike_goal(shift_days=sh, days_per_week=3, strength_days=0, weekly_hours=5.0)
+    plan = build_reference_plan(g, ZONES, until=date(2026, 12, 20))
+    _, weeks = cycling.week_plan(g, until=date(2026, 12, 20))
+    seen = False
+    for w in weeks:
+        week = [s for s in plan if s.week_index == w.index and s.sport == "bike"]
+        if len(week) == 3 and any(s.daytype == "shift" for s in week):
+            seen = True
+            assert sum(s.duration_min for s in week) >= 0.85 * w.hours * 60 - 10
+    assert seen
 
 
 def test_post_shift_data_is_excluded_from_analysis():

@@ -7,6 +7,7 @@ Periaatteet:
   → testiviikko (FTP-testi). Joka 4. viikko on kevyt (-30 % tunteja, vähemmän toistoja). Testin jälkeen uusi sykli
   alkaa päivitetyllä FTP:llä, joten watit seuraavat kehittymistäsi.
 * Viikkotunnit kasvavat enintään 8 % viikossa, katto = 1,5 × nykyinen (tai --max-hours).
+* Työvuorokalenterilla: ajot vapaille päiville, vuoropäivälle lyhyt valinnainen ajo (≤ 75 min) vain tarvittaessa.
 * Voimaharjoittelu on ylläpitoa: kohtuullinen volyymi, 2 toiston vara. Alavartalopainotteinen sessio ei osu
   päivälle ennen laatuajoa tai pitkää ajoa (silloin ylävartalopainotteinen).
 """
@@ -14,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from itertools import permutations
+from itertools import combinations, permutations
 
 from .models import Goal, Session
 from .shifts import day_type
@@ -201,7 +202,19 @@ def slot_kind(slot: str, week: Week) -> str:
     return "easy"
 
 
-def _ride(slot: str, base_min: float, week: Week, day: date, goal: Goal, zones, daytype: str = "") -> Session:
+SHIFT_RIDE_NOTE = " Tee vain jos vuoro sallii; jätä väliin, jos yö meni huonosti tai hälytyksiä tuli."
+
+
+def _ride(slot: str, base_min: float, week: Week, day: date, goal: Goal, zones, daytype: str = "",
+          on_shift: bool = False) -> Session:
+    sess = _ride_core(slot, base_min, week, day, goal, zones, daytype)
+    if on_shift:
+        sess.title += " (työvuorossa, valinnainen)"
+        sess.details += SHIFT_RIDE_NOTE
+    return sess
+
+
+def _ride_core(slot: str, base_min: float, week: Week, day: date, goal: Goal, zones, daytype: str = "") -> Session:
     ftp = goal.ftp
     kind = slot_kind(slot, week)
     if kind == "long":
@@ -261,19 +274,37 @@ def _is_hard(kind: str) -> bool:
     return kind != "easy"
 
 
+SHIFT_RIDE_MAX = 75  # vuoropäivän ajon enimmäiskesto (min)
+SHIFT_RIDE_PENALTY = 4  # vuoropäivä vain, jos vapaat päivät eivät riitä tai johtaisivat huonompaan ratkaisuun
+
+
+def shift_ride_ok(kind: str, week: Week) -> bool:
+    """Vuoropäivälle sopii peruskestävyysajo tai lyhyt laatuajo; ei pitkää ajoa eikä FTP-testiä."""
+    if kind == "easy":
+        return True
+    if kind in ("long", "test"):
+        return False
+    return quality_minutes(kind, week.step, week.deload)[2] <= SHIFT_RIDE_MAX
+
+
 def assign_rides(slot_kinds: dict[str, str], free_days: list[date], shifts,
-                 prev_ride: tuple[date, str] | None = None) -> dict[str, date] | None:
-    """Sijoittaa ajot vapaille päiville. Rajoitteet: laatuajo ei peräkkäisenä päivänä toisen laatuajon kanssa eikä
-    pitkän ajon jälkeen (laatu → pitkä sallitaan). Pehmeät: kova ajo ennen työvuoroa ja kovat peräkkäin kaikkein
-    vähiten. Palauttaa None, jos mahdotonta."""
+                 prev_ride: tuple[date, str] | None = None, shift_days: list[date] | None = None,
+                 shift_ok: dict[str, bool] | None = None) -> dict[str, date] | None:
+    """Sijoittaa ajot päiville. Rajoitteet: laatuajo ei peräkkäisenä päivänä toisen laatuajon kanssa eikä pitkän ajon
+    jälkeen (laatu → pitkä sallitaan). Pehmeät: kova ajo ennen työvuoroa, kovat peräkkäin ja vuoropäivän käyttö
+    (valinnainen, vain jos `shift_ok`). Palauttaa None, jos mahdotonta."""
     names = list(slot_kinds)
     kinds = dict(slot_kinds)
     if prev_ride:  # edellisen viikon viimeinen ajo (viikon rajan yli)
         kinds["_prev"] = prev_ride[1]
+    shift_set = set(shift_days or [])
+    shift_ok = shift_ok or {}
     best, best_key = None, None
-    for combo in permutations(sorted(free_days), len(names)):
+    for combo in permutations(sorted(set(free_days) | shift_set), len(names)):
         placed = dict(zip(names, combo))
-        ok, penalty = True, 0
+        if any(d in shift_set and not shift_ok.get(nm, False) for nm, d in placed.items()):
+            continue
+        ok, penalty = True, SHIFT_RIDE_PENALTY * sum(1 for d in placed.values() if d in shift_set)
         items = list(placed.items()) + ([("_prev", prev_ride[0])] if prev_ride else [])
         items.sort(key=lambda kv: kv[1])
         for (na, da), (nb, db) in zip(items, items[1:]):
@@ -295,42 +326,55 @@ def assign_rides(slot_kinds: dict[str, str], free_days: list[date], shifts,
 
 def build_week_shifts(week: Week, week_start: date, goal: Goal, zones,
                       prev_ride: tuple[date, str] | None = None) -> list[Session]:
-    """Viikko työvuorokalenterin mukaan: ajot vain vapaille päiville, voima ensisijaisesti vuoropäiville."""
+    """Viikko työvuorokalenterin mukaan: ajot ensisijaisesti vapaille päiville, vuoropäivä tarvittaessa (lyhyt,
+    valinnainen), voima ensisijaisesti vuoropäiville joilla ei ole ajoa."""
     shifts = goal.shift_days
     days = [week_start + timedelta(days=i) for i in range(7)]
     dtype = {d: day_type(d, shifts) for d in days}
     free = [d for d in days if dtype[d] == "free"]
+    shift_d = [d for d in days if dtype[d] == "shift"]
     n = goal.days_per_week
     total = week.hours * 60
     shares = SHARES[n]
+    kind_of = {nm: slot_kind(nm, week) for nm in PRIORITY[n]}
+    ok_on_shift = {nm: shift_ride_ok(k, week) for nm, k in kind_of.items()}
 
     placed: dict[str, date] = {}
     wanted = PRIORITY[n]
     for k in range(len(wanted), 0, -1):
-        names = wanted[:k]
-        if k > len(free):
-            continue
-        res = assign_rides({nm: slot_kind(nm, week) for nm in names}, free, shifts, prev_ride)
-        if res:
-            placed = res
+        for names in combinations(wanted, k):  # etusijalla tärkeimmät slotit
+            res = assign_rides({nm: kind_of[nm] for nm in names}, free, shifts, prev_ride, shift_d, ok_on_shift)
+            if res:
+                placed = res
+                break
+        if placed:
             break
-    by_day: dict[date, Session] = {}
+
     norm = sum(shares[nm] for nm in placed) or 1.0
+    mins = {nm: total * shares[nm] / norm for nm in placed}
+    deficit = 0.0
     for nm, d in placed.items():
-        by_day[d] = _ride(nm, total * shares[nm] / norm, week, d, goal, zones, "free")
+        if dtype[d] == "shift" and mins[nm] > SHIFT_RIDE_MAX:
+            deficit += mins[nm] - SHIFT_RIDE_MAX
+            mins[nm] = SHIFT_RIDE_MAX
+    if deficit and "long" in placed and dtype[placed["long"]] != "shift":
+        mins["long"] += deficit  # lyhyt vuoropäivän ajo korvataan pitkällä ajolla
+
+    by_day: dict[date, Session] = {}
+    for nm, d in placed.items():
+        by_day[d] = _ride(nm, mins[nm], week, d, goal, zones, dtype[d], on_shift=dtype[d] == "shift")
     if placed and len(placed) < n:
         first = min(by_day.values(), key=lambda x: x.day)
-        first.adjusted = f"Vapaita päiviä vain {len(free)} tällä viikolla: ajoja {len(placed)}/{n}"
+        first.adjusted = f"Ajoja mahtuu tällä viikolla vain {len(placed)}/{n} (työvuorot)"
 
-    hard_days = {d for d, s in by_day.items() if s.is_quality or s.kind == "long"}
-    cands = [d for d in days if dtype[d] == "shift"] + [d for d in free if d not in by_day]
+    hard_days = {d: s for d, s in by_day.items() if s.is_quality or s.kind == "long"}
+    cands = [d for d in shift_d if d not in by_day] + [d for d in free if d not in by_day]
     for d in cands[: goal.strength_days]:
-        nxt = d + timedelta(days=1)
-        emphasis = "upper" if nxt in hard_days else "lower"
+        emphasis = "upper" if (d + timedelta(days=1)) in hard_days else "lower"
         on_shift = dtype[d] == "shift"
-        mins = 45 if (week.deload or on_shift) else STRENGTH_MIN
-        title, det = describe_strength(mins, emphasis, week.deload, on_shift)
-        by_day[d] = _session(d, "strength", "strength", mins, week.phase, week.index, title, det, dtype[d])
+        m = 45 if (week.deload or on_shift) else STRENGTH_MIN
+        title, det = describe_strength(m, emphasis, week.deload, on_shift)
+        by_day[d] = _session(d, "strength", "strength", m, week.phase, week.index, title, det, dtype[d])
     return [by_day.get(d) or _rest(d, week, dtype[d]) for d in days]
 
 
