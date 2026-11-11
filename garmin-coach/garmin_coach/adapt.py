@@ -1,0 +1,224 @@
+"""Ohjelman mukauttaminen datan perusteella.
+
+Neljä tasoa, lyhyimmästä pisimpään vaikutukseen:
+1. Päivän valmius (HRV, leposyke, uni, kuorma) → tämän päivän sessio kevennetään tai vaihdetaan lepoon,
+   ja väliin jäänyt laatuharjoitus siirretään viikon myöhempään vapaaseen päivään, jos se mahtuu turvallisesti.
+2. HRV:n 7 vrk trendi alle normaalin → kuluvan viikon loput tehoharjoitukset muutetaan peruslenkeiksi.
+3. Akuutti kuorma liian korkea (ACWR > 1,5) → seuraavat 3 päivää kevyesti ja lyhyemmin.
+4. Toteuma: jos kahden edellisen viikon juoksumäärä jäi alle 80 % suunnitellusta, tulevien viikkojen
+   volyymi nostetaan toteutuneesta tasosta maltillisesti (+8 %/vko) eikä hypätä takaisin ohjelman tasolle.
+
+Ylisuorittaminen ei kasvata ohjelmaa: volyymia ei koskaan nosteta perusohjelman yläpuolelle.
+"""
+from __future__ import annotations
+
+from dataclasses import asdict, replace
+from datetime import date, timedelta
+
+from .analysis import Analysis
+from .models import WEEKDAYS_FI, Activity, Goal, Session
+from .planner import PHASE_RACE, WEEKLY_INCREASE, describe, monday, r05
+
+COMPLIANCE_THRESHOLD = 0.8
+MIN_SESSION_KM = 3.0
+
+
+def fmt_day(d: date) -> str:
+    return f"{WEEKDAYS_FI[d.weekday()]} {d.day}.{d.month}."
+
+
+def _rebuild(s: Session, kind: str, km: float, goal: Goal, zones, reason: str) -> Session:
+    km = 0.0 if kind == "rest" else r05(max(MIN_SESSION_KM, km))
+    title, details = describe(kind, km, s.phase, goal.kind, zones)
+    prev = f"{s.adjusted}; " if s.adjusted else ""
+    return replace(s, kind=kind, distance_km=km, title=title, details=details, adjusted=prev + reason)
+
+
+def _scale(s: Session, factor: float, goal: Goal, zones, reason: str) -> Session:
+    if s.kind in ("rest", "race") or factor >= 0.999:
+        return s
+    new_km = r05(max(MIN_SESSION_KM, s.distance_km * factor))
+    if new_km >= s.distance_km:
+        return s
+    return _rebuild(s, s.kind, new_km, goal, zones, reason)
+
+
+def run_km(activities: list[Activity], start: date, end: date) -> float:
+    return sum(a.distance_km or 0.0 for a in activities if a.is_run and start <= a.day <= end)
+
+
+def session_done(s: Session, activities: list[Activity]) -> bool | None:
+    """True/False menneille harjoituspäiville, None lepopäiville."""
+    if s.kind == "rest":
+        return None
+    km = run_km(activities, s.day, s.day)
+    return km >= 0.5 * s.distance_km if s.distance_km else km > 0
+
+
+def adapt_plan(
+    reference: list[Session],
+    goal: Goal,
+    zones: dict[str, tuple[int, int]],
+    as_of: date,
+    analysis: Analysis,
+    activities: list[Activity],
+    stored_past: list[Session],
+    overrides: dict[str, dict],
+) -> tuple[list[Session], list[str], dict[str, dict]]:
+    """Palauttaa (mukautettu ohjelma, huomiot, päivitetyt siirrot)."""
+    notes: list[str] = []
+    plan = {s.day: s for s in reference}
+    week0 = monday(as_of)
+
+    # Aiemmin tehdyt siirrot (esim. väliin jäänyt intervalli siirretty torstaille) pysyvät voimassa.
+    # Tämän päivän siirto lasketaan aina uudelleen tuoreimmalla datalla.
+    overrides = {k: v for k, v in overrides.items() if v["from"] != as_of.isoformat() and date.fromisoformat(k) >= as_of}
+    for day_s, ov in overrides.items():
+        d = date.fromisoformat(day_s)
+        if d in plan:
+            sd = dict(ov["session"])
+            sd["day"] = d
+            plan[d] = Session(**sd)
+
+    # 4. Toteuma kahdelta edelliseltä viikolta
+    w_start, w_end = week0 - timedelta(days=14), week0 - timedelta(days=1)
+    if goal.start_date <= w_start:
+        past_by_day = {s.day: s for s in stored_past}
+        planned = 0.0
+        d = w_start
+        while d <= w_end:
+            s = past_by_day.get(d) or plan.get(d)
+            if s and s.kind != "race":
+                planned += s.distance_km
+            d += timedelta(days=1)
+        actual = run_km(activities, w_start, w_end)
+        if planned > 0 and actual < COMPLIANCE_THRESHOLD * planned:
+            anchor = max(actual / 2, 0.4 * planned / 2)
+            reason = f"toteuma {actual:.0f}/{planned:.0f} km kahdella viikolla"
+            ref_peak = max(_week_volumes(reference).values())
+            new_peak = 0.0
+            for k in range(0, 60):
+                ws = week0 + timedelta(weeks=k)
+                days = [ws + timedelta(days=i) for i in range(7)]
+                week = [plan[x] for x in days if x in plan]
+                if not week:
+                    break
+                vol = sum(s.distance_km for s in week if s.kind != "race")
+                cap = anchor * WEEKLY_INCREASE ** (k + 1)
+                if week[0].phase != PHASE_RACE and vol > cap:
+                    f = cap / vol
+                    for s in week:
+                        if s.day >= as_of:
+                            plan[s.day] = _scale(s, f, goal, zones, f"Volyymi rajattu ({reason})")
+                new_peak = max(new_peak, sum(plan[x].distance_km for x in days if x in plan and plan[x].kind != "race"))
+            notes.append(
+                f"Edellisten kahden viikon juoksumäärä {actual:.0f} km jäi alle suunnitellun {planned:.0f} km. "
+                "Tulevien viikkojen volyymi nousee toteutuneesta tasosta enintään 8 % viikossa."
+            )
+            if goal.event_date and new_peak < 0.8 * ref_peak:
+                notes.append(
+                    f"Huippuviikon volyymi jää nyt n. {new_peak:.0f} km:iin (alkuperäinen {ref_peak:.0f} km). "
+                    "Harkitse tavoitteen keventämistä tai kilpailun siirtämistä."
+                )
+
+    # 3. Akuutti kuorma
+    acwr = analysis.load.acwr
+    if acwr is not None and acwr > 1.5:
+        reason = f"Kuorma noussut liian nopeasti (ACWR {acwr:.2f})"
+        changed = False
+        for i in range(3):
+            d = as_of + timedelta(days=i)
+            s = plan.get(d)
+            if s and s.kind not in ("rest", "race"):
+                kind = "easy" if s.is_quality or s.kind == "strides" else s.kind
+                plan[d] = _rebuild(s, kind, s.distance_km * 0.8, goal, zones, reason)
+                changed = True
+        if changed:
+            notes.append(f"{reason}: seuraavat 3 päivää kevyesti ja n. 20 % lyhyempinä.")
+
+    # 2. HRV-trendi
+    if analysis.hrv.status == "low":
+        reason = "HRV:n 7 vrk trendi alle normaalialueen"
+        changed = False
+        for i in range(7 - as_of.weekday()):
+            d = as_of + timedelta(days=i)
+            s = plan.get(d)
+            if s and s.is_quality and s.phase != PHASE_RACE:
+                plan[d] = _rebuild(s, "easy", s.distance_km, goal, zones, reason)
+                changed = True
+        if changed:
+            notes.append(f"{reason}: tämän viikon tehoharjoitukset vaihdettu peruslenkeiksi.")
+        else:
+            notes.append(f"{reason}: pidä loppuviikko kevyenä, vaikka ohjelmassa ei ole tehoharjoituksia.")
+
+    # 1. Päivän valmius
+    today = plan.get(as_of)
+    rd = analysis.readiness
+    if today and today.kind not in ("rest", "race") and rd.confidence != "low":
+        if rd.level == "red":
+            reason = f"Valmius {rd.score}/100 (punainen)"
+            plan[as_of] = _rebuild(today, "rest", 0, goal, zones, reason)
+            msg = f"{reason}: tämän päivän {today.title.lower()} vaihdettu lepoon."
+            if today.is_quality:
+                target = _find_slot(plan, as_of, goal)
+                if target:
+                    moved = replace(today, day=target, adjusted=f"Siirretty päivältä {fmt_day(as_of)} (huono valmius)")
+                    plan[target] = moved
+                    sd = asdict(moved)
+                    sd["day"] = target.isoformat()
+                    overrides[target.isoformat()] = {"from": as_of.isoformat(), "session": sd}
+                    msg += f" {today.title} siirretty päivälle {fmt_day(target)}."
+                else:
+                    msg += " Laatuharjoitus jätetään tältä viikolta väliin."
+            notes.append(msg)
+        elif rd.level == "yellow":
+            reason = f"Valmius {rd.score}/100 (keltainen)"
+            if today.is_quality:
+                plan[as_of] = _rebuild(today, "easy", today.distance_km * 0.8, goal, zones, reason)
+                notes.append(f"{reason}: tämän päivän {today.title.lower()} vaihdettu kevyeksi peruslenkiksi.")
+            elif today.kind == "long":
+                plan[as_of] = _rebuild(today, "long", today.distance_km * 0.8, goal, zones, reason)
+                notes.append(f"{reason}: pitkää lenkkiä lyhennetty 20 %.")
+
+    # Lisätään ennakkovaroitus ennen kisaa, mutta kisapäivää ei koskaan muuteta automaattisesti.
+    if today and today.kind == "race" and rd.level != "green":
+        notes.append("Kilpailupäivä ja valmius heikentynyt – aloita varovasti ja kuuntele kehoa.")
+
+    return [plan[d] for d in sorted(plan)], notes, overrides
+
+
+def _find_slot(plan: dict[date, Session], as_of: date, goal: Goal) -> date | None:
+    """Etsii kuluvalta viikolta lepopäivän, jonka naapuripäivinä ei ole kovaa harjoitusta."""
+    week_end = monday(as_of) + timedelta(days=6)
+    d = as_of + timedelta(days=2)  # vähintään yksi palautumispäivä välissä
+    while d <= week_end:
+        s = plan.get(d)
+        if s and s.kind == "rest":
+            neighbours = [plan.get(d - timedelta(days=1)), plan.get(d + timedelta(days=1))]
+            if all(n is None or (n.kind not in ("long", "race") and not n.is_quality) for n in neighbours):
+                return d
+        d += timedelta(days=1)
+    return None
+
+
+def _week_volumes(sessions: list[Session]) -> dict[date, float]:
+    out: dict[date, float] = {}
+    for s in sessions:
+        if s.kind != "race" and s.phase != PHASE_RACE:
+            out[monday(s.day)] = out.get(monday(s.day), 0.0) + s.distance_km
+    return out or {date.min: 0.0}
+
+
+def diff_plans(old: list[Session], new: list[Session]) -> list[str]:
+    """Ihmisluettava lista muutoksista vanhan ja uuden ohjelman välillä (vain päivät, jotka ovat molemmissa)."""
+    old_by = {s.day: s for s in old}
+    out = []
+    for n in new:
+        o = old_by.get(n.day)
+        if not o:
+            continue
+        if o.kind != n.kind or abs(o.distance_km - n.distance_km) >= 0.5:
+            what = lambda s: s.title if s.kind == "rest" else f"{s.title} {s.distance_km:g} km"  # noqa: E731
+            why = f" ({n.adjusted})" if n.adjusted else ""
+            out.append(f"{fmt_day(n.day)}: {what(o)} → {what(n)}{why}")
+    return out
