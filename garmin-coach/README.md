@@ -1,8 +1,8 @@
 # Garmin Coach
 
 A command-line tool that reads Garmin heart-rate, HRV and sleep data, works out daily **readiness**,
-and builds a **training plan that updates itself** for your goal (5 km, 10 km, half marathon,
-marathon or general fitness). Every time the plan is updated, the program writes down what
+and builds a **training plan that updates itself** for your goal (**cycling fitness + strength maintenance**,
+5 km, 10 km, half marathon, marathon or general running fitness). Every time the plan is updated, the program writes down what
 changed and why, and generates an HTML report that also works on a phone.
 
 All data stays local (SQLite, default `~/.garmin_coach/data.db`).
@@ -78,7 +78,8 @@ Running more than planned never raises the plan: volume is never set above the b
   `check-garmin` is the first real test. CSV import is the fallback.
 - The readiness weights are **heuristic**, not a validated medical model. If you have symptoms
   of illness, don't train no matter what the score says.
-- The training plan is running-focused. Other sports are counted in the load but not planned.
+- The plan is a fixed weekly template. If your schedule varies (e.g. shift work), pick `--long-day` and expect to
+  skip or swap sessions yourself; missed quality sessions are only re-slotted automatically after a red readiness day.
 - The plan doesn't know your paces; intensity is guided by heart-rate zones (Karvonen). A measured
   max HR is much better than an age-based estimate (`--age`).
 
@@ -87,6 +88,26 @@ Running more than planned never raises the plan: volume is never set above the b
 ```bash
 pip install -e ".[dev]" && pytest
 ```
+
+## Cycling + strength goal
+
+```bash
+garmin-coach profile --max-hr 190 --ftp 255
+garmin-coach goal --type cycling --days 3 --strength-days 2 --hours 4 --long-day su
+garmin-coach plan
+```
+`--days` = rides per week (3–5), `--hours` = your current riding time per week, `--max-hours` optional cap
+(default 1.5 × current). The plan is a 12-week cycle: base (sweet spot, tempo) → build (threshold, over-unders)
+→ peak (VO2max + threshold) → test week (20-min FTP test). Every 4th week is lighter. Targets are in **watts**
+from your FTP; after a test run `garmin-coach profile --ftp <new>` and the plan updates.
+Strength sessions go on their own days (lower body never the day before a quality or long ride, then it is
+upper-body focused). The strength content is a generic frame: keep your own exercises.
+
+Adaptation works the same as for running (readiness, HRV trend, load spikes, heavy previous day), with these differences:
+quality rides are never shortened to meet a volume cap (volume is trimmed from easy and long rides), strength
+sessions get a lighter version (2 sets/exercise) instead of being dropped, and completion is measured in
+**riding minutes** only. Strength and other sports count toward load, not toward cycling completion.
+Not supported yet: a target event date for cycling, power-based load (load comes from Garmin or average HR).
 
 ## Correcting a mislabelled activity
 

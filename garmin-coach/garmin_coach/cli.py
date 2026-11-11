@@ -41,13 +41,18 @@ def cmd_profile(st: Store, a) -> None:
         p.resting_hr = a.resting_hr or None
     if a.sleep_target:
         p.sleep_target_h = a.sleep_target
+    if a.ftp:
+        p.ftp = a.ftp
     st.save_profile(p)
-    print(f"Profiili: maksimisyke {p.max_hr}, leposyke {p.resting_hr or 'mitattu perustaso'}, unitavoite {p.sleep_target_h} h")
+    print(f"Profiili: maksimisyke {p.max_hr}, leposyke {p.resting_hr or 'mitattu perustaso'}, unitavoite {p.sleep_target_h} h"
+          + (f", FTP {p.ftp} W" if p.ftp else ""))
 
 
 def cmd_goal(st: Store, a) -> None:
-    g = Goal(kind=a.type, start_date=a.start or date.today(), event_date=a.date, days_per_week=a.days,
-             weekly_km=a.weekly_km, long_run_weekday=a.long_day, target_time=a.target_time)
+    days = a.days or (3 if a.type == "cycling" else 4)
+    g = Goal(kind=a.type, start_date=a.start or date.today(), event_date=a.date, days_per_week=days,
+             weekly_km=a.weekly_km, long_run_weekday=a.long_day, target_time=a.target_time,
+             strength_days=a.strength_days, weekly_hours=a.hours, max_weekly_hours=a.max_hours)
     g.validate()
     st.save_goal(g)
     print(f"Tavoite tallennettu: {GOAL_LABELS[g.kind]}" + (f", kilpailu {g.event_date}" if g.event_date else ""))
@@ -109,9 +114,8 @@ def cmd_plan(st: Store, a) -> None:
         print("\nEi muutoksia edelliseen versioon.")
     print(f"\nOhjelma {a.show} päivää:")
     for s in res.sessions[: a.show]:
-        dist = "" if s.kind == "rest" else f"{s.distance_km:>5g} km"
         mark = " ↻" if s.adjusted else ""
-        print(f"  {fmt_day(s.day):<9} {s.title:<22}{dist:>9}{mark}  {s.details if s.kind != 'rest' else ''}")
+        print(f"  {fmt_day(s.day):<9} {s.title:<22}{s.label:>9}{mark}  {s.details if s.kind != 'rest' else ''}")
 
 
 def cmd_status(st: Store, a) -> None:
@@ -193,15 +197,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--age", type=int, help="arvioi maksimisyke iästä, jos mitattua ei ole")
     sp.add_argument("--resting-hr", type=int, help="kiinteä leposyke (0 = käytä mitattua)")
     sp.add_argument("--sleep-target", type=float, help="unitavoite tunteina")
+    sp.add_argument("--ftp", type=int, help="pyöräilyn FTP wateissa (päivitä testin jälkeen)")
     sp.set_defaults(func=cmd_profile)
 
     sp = sub.add_parser("goal", help="aseta tavoite")
     sp.add_argument("--type", choices=GOAL_KINDS, required=True)
     sp.add_argument("--date", type=_date, help="kilpailupäivä YYYY-MM-DD")
     sp.add_argument("--start", type=_date, help="ohjelman aloituspäivä (oletus tänään)")
-    sp.add_argument("--days", type=int, default=4, help="harjoituspäiviä viikossa (3–6)")
+    sp.add_argument("--days", type=int, help="harjoituspäiviä viikossa (juoksu 3–6, pyöräily 3–5; oletus 4 / 3)")
+    sp.add_argument("--strength-days", type=int, default=2, help="pyöräilytavoite: voimaharjoituksia viikossa (0–3)")
+    sp.add_argument("--hours", type=float, default=4.0, help="pyöräilytavoite: nykyinen pyöräilyaika h/vko")
+    sp.add_argument("--max-hours", type=float, help="pyöräilytavoite: viikkotuntien katto (oletus 1,5 × nykyinen)")
     sp.add_argument("--weekly-km", type=float, default=20.0, help="nykyinen juoksumäärä km/vko")
-    sp.add_argument("--long-day", type=_weekday, default=6, help="pitkän lenkin päivä (ma–su)")
+    sp.add_argument("--long-day", type=_weekday, default=6, help="pitkän lenkin/ajon päivä (ma–su)")
     sp.add_argument("--target-time", help="tavoiteaika, esim. 1:55:00 (tallennetaan tiedoksi)")
     sp.set_defaults(func=cmd_goal)
 

@@ -372,3 +372,174 @@ def test_activity_override_survives_resync():
     st.upsert_activities([a])  # uusi synkronointi kirjoittaa alkuperäisen takaisin
     got = st.activities()[0]
     assert got.sport == "smoke_diving" and got.load == 300.0 and not got.is_run
+
+
+# --- pyöräily + voima ---------------------------------------------------------------------
+from garmin_coach import cycling  # noqa: E402
+from garmin_coach.adapt import session_done  # noqa: E402
+
+
+def bike_goal(**kw):
+    base = dict(kind="cycling", start_date=date(2026, 11, 9), days_per_week=3, strength_days=2,
+                weekly_hours=4.0, long_run_weekday=6, ftp=255)
+    base.update(kw)
+    return Goal(**base)
+
+
+@pytest.mark.parametrize("bikes,strength", [(3, 0), (3, 2), (3, 3), (4, 2), (5, 1)])
+@pytest.mark.parametrize("long_day", [4, 5, 6])
+def test_cycling_week_structure(bikes, strength, long_day):
+    g = bike_goal(days_per_week=bikes, strength_days=strength, long_run_weekday=long_day)
+    plan = build_reference_plan(g, ZONES, until=date(2027, 2, 14))
+    assert len({s.day for s in plan}) == len(plan), "kaksi sessiota samalle päivälle"
+    for wk in sorted({monday(s.day) for s in plan}):
+        week = sorted((s for s in plan if monday(s.day) == wk), key=lambda s: s.day)
+        assert len(week) == 7
+        assert sum(1 for s in week if s.sport == "bike") == bikes
+        assert sum(1 for s in week if s.sport == "strength") == strength
+        assert any(s.kind == "rest" for s in week)
+        longs = [s for s in week if s.kind == "long"]
+        assert len(longs) == 1 and longs[0].day.weekday() == long_day
+        q = sorted(s.day for s in week if s.is_quality)
+        for a, b in zip(q, q[1:]):
+            assert (b - a).days > 1
+        by = {s.day: s for s in plan}
+        for s in week:
+            nxt = by.get(s.day + timedelta(days=1))
+            if s.sport == "strength" and nxt and (nxt.is_quality or nxt.kind == "long"):
+                assert "ylävartalo" in s.title, "alavartalovoima ennen laatu-/pitkää ajoa"
+            if s.sport == "bike":
+                assert s.distance_km == 0 and s.duration_min >= cycling.MIN_BIKE_MIN
+
+
+def test_cycling_volume_progression_deload_and_test_week():
+    g = bike_goal()
+    _, weeks = cycling.week_plan(g, until=date(2027, 3, 1))
+    cap = min(max(4.0 * 1.5, 4.0 + 2), 12.0)
+    for i, w in enumerate(weeks):
+        assert w.hours <= cap + 1e-6
+        if w.deload:
+            assert w.hours < weeks[i - 1].hours * 0.8 or i == 0
+    assert [w.phase for w in weeks[:12]][:4] == ["Peruskausi"] * 3 + ["Kevyt viikko"]
+    assert weeks[11].test and weeks[11].phase == "Testiviikko"
+    plan = build_reference_plan(g, ZONES, until=date(2027, 3, 1))
+    test_week = [s for s in plan if s.week_index == 11]
+    assert any(s.kind == "test" and "profile --ftp" in s.details for s in test_week)
+    assert not any(s.is_quality and s.kind != "test" for s in test_week)
+    assert any(s.kind == "vo2" for s in plan), "huippukaudella VO2max"
+    assert any(s.kind == "threshold" for s in plan)
+
+
+def test_cycling_watts_follow_ftp():
+    p250 = build_reference_plan(bike_goal(ftp=250), ZONES, until=date(2026, 12, 6))
+    p300 = build_reference_plan(bike_goal(ftp=300), ZONES, until=date(2026, 12, 6))
+    ss250 = next(s for s in p250 if s.kind == "sweetspot")
+    ss300 = next(s for s in p300 if s.kind == "sweetspot")
+    assert f"{cycling.r5(250 * 0.88)}–{cycling.r5(250 * 0.94)} W" in ss250.details
+    assert f"{cycling.r5(300 * 0.88)}–{cycling.r5(300 * 0.94)} W" in ss300.details
+    no_ftp = next(s for s in build_reference_plan(bike_goal(ftp=None), ZONES, until=date(2026, 12, 6)) if s.kind == "sweetspot")
+    assert "% FTP" in no_ftp.details and " W (" not in no_ftp.details
+
+
+def test_cycling_goal_validation():
+    for kw in ({"days_per_week": 6}, {"days_per_week": 5, "strength_days": 2}, {"strength_days": 4},
+               {"event_date": date(2027, 6, 1)}, {"weekly_hours": 1.0}, {"max_weekly_hours": 2.0}):
+        with pytest.raises(ValueError):
+            bike_goal(**kw).validate()
+    bike_goal().validate()
+
+
+def _bike_plan_and_day(kind):
+    g = bike_goal()
+    plan = build_reference_plan(g, ZONES, until=date(2027, 1, 31))
+    day = next(s.day for s in plan if s.kind == kind and s.day > g.start_date)
+    return g, plan, day
+
+
+def test_bike_red_readiness_rests_and_yellow_softens():
+    g, plan, day = _bike_plan_and_day("sweetspot")
+    new, notes, _ = adapt_plan(plan, g, ZONES, day, neutral_analysis("red", 30), [], [], {})
+    assert {s.day: s for s in new}[day].kind == "rest" and notes
+    new, notes, _ = adapt_plan(plan, g, ZONES, day, neutral_analysis("yellow", 60), [], [], {})
+    t = {s.day: s for s in new}[day]
+    orig = {s.day: s for s in plan}[day]
+    assert t.kind == "easy" and t.sport == "bike" and t.duration_min < orig.duration_min and "W" in t.details
+
+
+def test_strength_is_lightened_not_dropped_on_yellow():
+    g = bike_goal()
+    plan = build_reference_plan(g, ZONES, until=date(2027, 1, 31))
+    day = next(s.day for s in plan if s.sport == "strength" and s.day > g.start_date)
+    new, notes, _ = adapt_plan(plan, g, ZONES, day, neutral_analysis("yellow", 60), [], [], {})
+    t = {s.day: s for s in new}[day]
+    assert t.kind == "strength" and "Kevyt versio" in t.details and t.adjusted
+
+
+def test_bike_compliance_uses_bike_minutes_and_ignores_strength():
+    g = bike_goal(start_date=date(2026, 10, 5))
+    plan = build_reference_plan(g, ZONES, until=date(2027, 1, 31))
+    as_of = date(2026, 11, 11)
+    w0 = monday(as_of)
+    # Ajettu vain 60 min kahdella viikolla, mutta voimaharjoituksia tehty paljon: ei saa laskea toteumaa
+    acts = [Activity("r", w0 - timedelta(days=5), "Ride", 60, None, 140)] + [
+        Activity(f"s{i}", w0 - timedelta(days=i), "WeightTraining", 70, None, 100) for i in range(1, 8)]
+    new, notes, _ = adapt_plan(plan, g, ZONES, as_of, neutral_analysis(), acts, [], {})
+    assert any("pyöräilyaika" in n for n in notes)
+    nxt = monday(as_of) + timedelta(weeks=1)
+    ref_min = sum(s.duration_min for s in plan if monday(s.day) == nxt and s.sport == "bike")
+    new_min = sum(s.duration_min for s in new if monday(s.day) == nxt and s.sport == "bike")
+    assert new_min < ref_min
+    strength_ref = [(s.day, s.duration_min) for s in plan if monday(s.day) == nxt and s.sport == "strength"]
+    strength_new = [(s.day, s.duration_min) for s in new if monday(s.day) == nxt and s.sport == "strength"]
+    assert strength_ref == strength_new
+    # Riittävä pyöräilymäärä: ei rajoitusta
+    planned = sum(x.duration_min for x in plan if x.sport == "bike" and w0 - timedelta(days=14) <= x.day < w0)
+    ok = [Activity(f"r{i}", w0 - timedelta(days=i), "Ride", planned * 1.1 / 4, None, 140) for i in range(1, 5)]
+    _, notes2, _ = adapt_plan(plan, g, ZONES, as_of, neutral_analysis(), ok, [], {})
+    assert not any("pyöräilyaika" in n for n in notes2)
+
+
+def test_sport_classification_and_session_done():
+    bikes = ["Ride", "VirtualRide", "cycling", "indoor_cycling", "road_biking", "mountain_biking", "gravel_cycling"]
+    assert all(Activity("x", TODAY, s, 10).is_bike for s in bikes)
+    assert all(Activity("x", TODAY, s, 10).is_strength for s in ["WeightTraining", "strength_training"])
+    for s in ["HighIntensityIntervalTraining", "hyrox", "smoke_diving", "running", "hiit"]:
+        a = Activity("x", TODAY, s, 10)
+        assert not a.is_bike and not a.is_strength
+    g, plan, day = _bike_plan_and_day("sweetspot")
+    s = {x.day: x for x in plan}[day]
+    assert session_done(s, [Activity("a", day, "Ride", s.duration_min * 0.8)]) is True
+    assert session_done(s, [Activity("a", day, "WeightTraining", 90)]) is False
+    assert session_done(s, [Activity("a", day, "HighIntensityIntervalTraining", 90)]) is False
+
+
+def test_store_migrates_old_plan_table(tmp_path):
+    import sqlite3
+    db = tmp_path / "old.db"
+    c = sqlite3.connect(db)
+    c.executescript("""CREATE TABLE plan_sessions (day TEXT PRIMARY KEY, kind TEXT NOT NULL, distance_km REAL NOT NULL,
+        title TEXT NOT NULL, details TEXT NOT NULL, phase TEXT NOT NULL, week_index INTEGER NOT NULL, adjusted TEXT);
+        INSERT INTO plan_sessions VALUES ('2026-11-12','easy',8.0,'Peruslenkki','8 km','Peruskausi',1,NULL);""")
+    c.commit(); c.close()
+    st = Store(db)
+    s = st.plan()[0]
+    assert s.sport == "run" and s.distance_km == 8.0 and s.duration_min == 0.0
+    st.replace_plan_from(date(2026, 11, 12), [replace(s, sport="bike", duration_min=60.0, distance_km=0.0)])
+    assert st.plan()[0].sport == "bike"
+
+
+def test_cycling_end_to_end_with_smoke_dive_correction(tmp_path):
+    from garmin_coach.cli import main
+    db, out = str(tmp_path / "b.db"), tmp_path / "b.html"
+    assert main(["--db", db, "profile", "--max-hr", "190", "--ftp", "255"]) == 0
+    assert main(["--db", db, "goal", "--type", "cycling", "--start", "2026-11-09", "--hours", "4", "--strength-days", "2"]) == 0
+    assert main(["--db", db, "sync", "demo", "--days", "60", "--end", TODAY.isoformat()]) == 0
+    st = Store(db)
+    st.upsert_activities([Activity("hiit1", TODAY - timedelta(days=1), "HighIntensityIntervalTraining", 21, None, 119)])
+    st.close()
+    assert main(["--db", db, "tag", "hiit1", "--sport", "smoke_diving", "--intensity", "moderate"]) == 0
+    assert main(["--db", db, "plan", "--as-of", TODAY.isoformat()]) == 0
+    assert main(["--db", db, "report", "--as-of", TODAY.isoformat(), "-o", str(out)]) == 0
+    html = out.read_text()
+    assert "Pyöräilykunto" in html and "FTP 255 W" in html and "Voima:" in html
+    assert main(["--db", db, "goal", "--type", "cycling", "--days", "6"]) == 2

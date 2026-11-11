@@ -257,6 +257,10 @@ def _normal_week(week_start: date, w: int, phase: str, volume: float, goal: Goal
 def build_reference_plan(goal: Goal, zones: dict[str, tuple[int, int]], until: date | None = None) -> list[Session]:
     """Koko perusohjelma tavoitteen alusta kilpailuun (tai `until`-päivään asti yleiskuntotavoitteella)."""
     goal.validate()
+    if goal.kind == "cycling":
+        from .cycling import build_cycling_plan
+
+        return build_cycling_plan(goal, zones, until)
     start, weeks = week_plan(goal, until)
     sessions: list[Session] = []
     for w, (phase, vol) in enumerate(weeks):

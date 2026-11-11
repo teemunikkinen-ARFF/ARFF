@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, timedelta
 
 from .adapt import adapt_plan, diff_plans
@@ -39,7 +39,8 @@ def update_plan(store: Store, as_of: date) -> UpdateResult:
     zones = hr_zones(profile.max_hr, analysis.resting_hr_used)
 
     until = goal.event_date or (as_of + timedelta(weeks=FITNESS_HORIZON_WEEKS))
-    reference = build_reference_plan(goal, zones, until)
+    goal_eff = replace(goal, ftp=profile.ftp)  # FTP elää profiilissa; ohjelma rakennetaan aina tuoreella arvolla
+    reference = build_reference_plan(goal_eff, zones, until)
 
     goal_sig = json.dumps(asdict(goal), default=str, sort_keys=True)
     regenerated = store.get_value("goal_sig") != goal_sig
@@ -48,7 +49,7 @@ def update_plan(store: Store, as_of: date) -> UpdateResult:
     activities = store.activities(as_of - timedelta(days=HISTORY_DAYS), as_of)
     stored_past = store.plan(as_of - timedelta(days=21), as_of - timedelta(days=1))
     sessions, notes, overrides = adapt_plan(
-        reference, goal, zones, as_of, analysis, activities, stored_past, overrides
+        reference, goal_eff, zones, as_of, analysis, activities, stored_past, overrides
     )
     future = [s for s in sessions if s.day >= as_of]
 

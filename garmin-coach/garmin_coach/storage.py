@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS plan_sessions (
     day TEXT PRIMARY KEY,
     kind TEXT NOT NULL, distance_km REAL NOT NULL, title TEXT NOT NULL, details TEXT NOT NULL,
-    phase TEXT NOT NULL, week_index INTEGER NOT NULL, adjusted TEXT
+    phase TEXT NOT NULL, week_index INTEGER NOT NULL, adjusted TEXT,
+    sport TEXT NOT NULL DEFAULT 'run', duration_min REAL NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS plan_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,6 +52,16 @@ class Store:
         self.conn = sqlite3.connect(str(path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Vanhat tietokannat: lisää puuttuvat sarakkeet (ohjelmaan lisätty laji ja kesto)."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(plan_sessions)")}
+        if "sport" not in cols:
+            self.conn.execute("ALTER TABLE plan_sessions ADD COLUMN sport TEXT NOT NULL DEFAULT 'run'")
+        if "duration_min" not in cols:
+            self.conn.execute("ALTER TABLE plan_sessions ADD COLUMN duration_min REAL NOT NULL DEFAULT 0")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -165,6 +176,7 @@ class Store:
             Session(
                 day=_d(r["day"]), kind=r["kind"], distance_km=r["distance_km"], title=r["title"],
                 details=r["details"], phase=r["phase"], week_index=r["week_index"], adjusted=r["adjusted"],
+                sport=r["sport"], duration_min=r["duration_min"],
             )
             for r in rows
         ]
@@ -176,8 +188,10 @@ class Store:
             if s.day < from_day:
                 continue
             self.conn.execute(
-                "INSERT OR REPLACE INTO plan_sessions VALUES (?,?,?,?,?,?,?,?)",
-                (s.day.isoformat(), s.kind, s.distance_km, s.title, s.details, s.phase, s.week_index, s.adjusted),
+                "INSERT OR REPLACE INTO plan_sessions (day, kind, distance_km, title, details, phase, week_index, adjusted, "
+                "sport, duration_min) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (s.day.isoformat(), s.kind, s.distance_km, s.title, s.details, s.phase, s.week_index, s.adjusted,
+                 s.sport, s.duration_min),
             )
         self.conn.commit()
 

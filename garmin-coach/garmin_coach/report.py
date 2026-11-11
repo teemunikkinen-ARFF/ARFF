@@ -102,18 +102,20 @@ def render(as_of: date, analysis: Analysis, goal: Goal | None, profile: Profile,
     if goal:
         when = f" · {goal.event_date.day}.{goal.event_date.month}.{goal.event_date.year}" if goal.event_date else ""
         left = f" · {(goal.event_date - as_of).days} pv jäljellä" if goal.event_date and goal.event_date >= as_of else ""
-        goal_html = f"<p><b>{_e(GOAL_LABELS[goal.kind])}</b>{when}{left} · {goal.days_per_week} harjoitusta/vko</p>"
+        freq = (f"{goal.days_per_week} ajoa + {goal.strength_days} voimaharjoitusta/vko" if goal.kind == "cycling"
+                else f"{goal.days_per_week} harjoitusta/vko")
+        ftp = f" · FTP {profile.ftp} W" if goal.kind == "cycling" and profile.ftp else ""
+        goal_html = f"<p><b>{_e(GOAL_LABELS[goal.kind])}</b>{when}{left} · {freq}{ftp}</p>"
 
     rows = []
     for s in past_plan[-7:]:
         done = session_done(s, activities)
         mark = "" if done is None else ('<span class="ok">✓ tehty</span>' if done else '<span class="miss">✗ ei tehty</span>')
-        dist = "" if s.kind == "rest" else f"{s.distance_km:g}"
-        rows.append(f'<tr class="past"><td>{fmt_day(s.day)}</td><td>{_e(s.title)} {mark}</td><td>{dist}</td></tr>')
+        rows.append(f'<tr class="past"><td>{fmt_day(s.day)}</td><td>{_e(s.title)} {mark}</td><td>{_e(s.label)}</td></tr>')
     for s in future_plan[:21]:
         cls = "today" if s.day == as_of else ""
         adj = f'<div class="adj">↻ {_e(s.adjusted)}</div>' if s.adjusted else ""
-        dist = "" if s.kind == "rest" else f"{s.distance_km:g}"
+        dist = _e(s.label)
         det = "" if s.kind == "rest" else f'<div class="det">{_e(s.details)}</div>'
         rows.append(f'<tr class="{cls} k-{s.kind}"><td>{fmt_day(s.day)}</td><td><b>{_e(s.title)}</b> '
                     f'<span class="phase">{_e(s.phase)}</span>{det}{adj}</td><td>{dist}</td></tr>')
